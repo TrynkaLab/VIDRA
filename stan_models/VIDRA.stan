@@ -19,12 +19,16 @@ data {
   vector[N] xc; 
   vector[N] xcse; 
 // Protein In-silico predictions
-  vector[N] as_conservation;
-  vector[N] as_sift;
-  vector[N] as_polyphen;
+//  vector[N] as_conservation;
+//  vector[N] as_sift;
+//  vector[N] as_polyphen;
   vector[N] as_cadd;
   vector[N] as_alphamissense;
   vector[N] as_revel;
+//  vector[N] as_blosum62;
+//  vector[N] as_foldx;
+//  vector[N] as_consequence;
+//  vector[N] as_plddt;
 
 // // Measure of the Y axis - i.e. disease risk
 
@@ -34,7 +38,7 @@ data {
 
 // Phenotype severity approximation for ClinVar variants
   vector[N] as_clinicalSignificance;
-  vector[N] as_primateai;  
+//  vector[N] as_primateai;  
 }
 
 parameters {
@@ -89,18 +93,18 @@ transformed parameters {
 model {
 // Protein
 // sd have been calculated on the sd of the different tools in the whole prediction set
-protein_prior ~ normal( as_blosum62, .05); 
-protein_prior ~ normal( as_foldx, .05);
-protein_prior ~ normal( as_plddt, .05); 
-protein_prior ~ normal( as_conservation, .1); 
-protein_prior ~ normal( as_sift, .05);
+// protein_prior ~ normal( as_blosum62, .05); 
+// protein_prior ~ normal( as_foldx, .05);
+// protein_prior ~ normal( as_plddt, .05); 
+// protein_prior ~ normal( as_conservation, .1); 
+// protein_prior ~ normal( as_sift, .05);
 protein_prior ~ normal( as_revel, .28);
 protein_prior ~ normal( as_cadd, .13); // for the moment is seems cadd only gives the best outcome - so I may comment the other predictors
 protein_prior ~ normal( as_alphamissense, .3);
-protein_prior ~ normal( as_consequence, .1);
+// protein_prior ~ normal( as_consequence, .1);
 // Disease
-disease_prior ~ normal( as_clinicalSignificance, .2);
-disease_prior ~ normal( as_primateai, .2); // This is very noisy and doesn't add much to the model
+disease_prior ~ normal( as_clinicalSignificance, .2); 
+// disease_prior ~ normal( as_primateai, .2); // This is very noisy and doesn't add much to the model
 
 // Intercept prior
 intercept ~ normal(0, 10);
@@ -127,10 +131,10 @@ for (n in 1:N) {
     yOR ~ normal( yORest, yORse);
     xcest ~ normal( 0, .2);
     if ( numG2[n] == 0 ) { // eQTL
-      yORest[n] ~ student_t( nu, xcest[n] * slope_random[1], abs(yORest[n] / xcest));
+      yORest[n] ~ student_t( nu, xcest[n] * slope_random[1], abs(yORest[n] / xcest[n]));
     } else 
     if ( numG2[n] == 1 ) { // pQTL
-      yORest[n] ~ student_t( nu, xcest[n] * slope_random[2], abs(yORest[n] / xcest));
+      yORest[n] ~ student_t( nu, xcest[n] * slope_random[2], abs(yORest[n] / xcest[n]));
       }
     } 
   else 

@@ -42,22 +42,22 @@ protein_prior ~ normal( as_alphamissense, .05);
 disease_prior ~ normal( as_clinicalSignificance, .05);
 disease_prior ~ normal( as_primateai, .05);
 slope ~ normal( 0, 5 );
-if (numG1 == 0) { // Common variants
+if (numG1 == 0) { // QTL common variants (eQTL or pQTL)
   // // Priors
   xc ~ normal( xcest, xcse);
   yOR ~ normal( yORest, yORse);
   slope ~ normal(yOR / xc, abs(yORse/xcest));
   } 
 else 
-if (numG1 == 1) { // common coding GWAS
+if (numG1 == 1) { // AZ PheWAS rare variants
   slope ~ normal(yORest / protein_prior, abs(yORse/0.1));
 } 
 else 
-if (numG1 == 2) { // AZ PheWAS
+if (numG1 == 2) { // ClinVar rare variants
   slope ~ normal(yORest / protein_prior, abs(yORse/0.1));
 } 
 else 
-if (numG1 == 3) { // Rare variants
+if (numG1 == 3) { // Coding GWAS (single-variant coding GWAS are filtered out before reaching here)
   slope ~ normal(disease_prior / protein_prior, 0.1); 
 }
 }
