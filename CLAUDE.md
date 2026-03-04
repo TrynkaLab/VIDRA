@@ -47,13 +47,14 @@ bash scripts/pyspark_scripts/run_annotation_vm.sh --no-delete  # keep VM for deb
 
 ### Step 3: Bayesian analysis
 ```bash
-# Full run:
+# Full run (24h TTL, 20 executors scaling to 50):
 gcloud dataproc batches submit pyspark \
   scripts/pyspark_scripts/run_bayesian_analysis.py \
   --project=open-targets-genetics-dev --region=europe-west1 \
   --deps-bucket=gs://vidra-2-0 \
   --container-image=europe-west1-docker.pkg.dev/open-targets-genetics-dev/opentargets/vidra-spark:v1 \
-  --properties=spark.sql.execution.arrow.pyspark.enabled=true \
+  --ttl=86400s \
+  --properties=spark.sql.execution.arrow.pyspark.enabled=true,spark.executor.instances=20,spark.dynamicAllocation.maxExecutors=50 \
   -- --bucket_name=vidra-2-0
 
 # Specific genes (upload a text file of ENSG IDs first):
@@ -114,8 +115,8 @@ Missense-specific annotations (`GENE_MEAN_IMPUTE_COLS`: `as_revel`, `as_alphamis
 
 Both models are in `stan_models/`. Changes require rebuilding the Docker image.
 
-- **`VIDRA.stan`** — Multi-variant hierarchical model used when a (gene, disease) pair has >1 unique variant. Estimates `slope_random[1..5]` per source and a hierarchical `slope`. Currently uses 4 active annotations: `as_revel`, `as_cadd`, `as_alphamissense` (protein_prior) and `as_clinicalSignificance` (disease_prior); others are commented out. `xcest` has a tight `normal(0, 0.2)` prior; `intercept` has a weak `normal(0, 10)` prior. ADVI: tries fullrank first, falls back to meanfield for large N (>~100 variants, where fullrank's O(P²) covariance over P=4N+8 parameters becomes ill-conditioned).
-- **`VIDRA_single_variant.stan`** — Single-variant model. Declares 7 annotations in the data block but only 5 are actively used in the model: `as_conservation`, `as_cadd`, `as_alphamissense` (protein_prior) and `as_clinicalSignificance`, `as_primateai` (disease_prior). `as_sift` and `as_polyphen` are declared but unused. The `slope ~ normal(yOR/xc, ...)` division only executes inside `if (numG1 == 0)`, so `xc=0.0` for non-QTL variants is safe — Stan never evaluates that branch for them.
+- **`VIDRA.stan`** — Multi-variant hierarchical model used when a (gene, disease) pair has >1 unique variant. Estimates `slope_random[1..5]` per source and a hierarchical `slope`. Currently uses 4 active annotations: `as_revel`, `as_cadd`, `as_alphamissense` (protein_prior) and `as_clinicalSignificance` (disease_prior); others are commented out. `xcest` and `yORest` have unconditional weak priors (`normal(0, 0.2)` and `normal(0, 1.0)`) to ensure a proper posterior even for ClinVar-only diseases where no QTL branch fires; `intercept` has a weak `normal(0, 10)` prior. ADVI: uses meanfield directly for N>`FULLRANK_MAX_N` (200 variants) because fullrank's O(P²) covariance over P=4N+8 parameters becomes prohibitively slow (hours for N~1000); for smaller N, uses fullrank. Any ADVI failure propagates to the error handler and produces an error_report row.
+- **`VIDRA_single_variant.stan`** — Single-variant model. Declares 7 annotations in the data block but only 5 are actively used in the model: `as_conservation`, `as_cadd`, `as_alphamissense` (protein_prior) and `as_clinicalSignificance`, `as_primateai` (disease_prior). `as_sift` and `as_polyphen` are declared but unused. `xcest` and `yORest` have unconditional weak priors for proper posterior. The `slope ~ normal(yOR/xc, ...)` division inside `if (numG1 == 0)` is further guarded by `if (abs(xc) > 1e-4)` to prevent inf when the QTL effect data is zero.
 
 ## Code layout
 

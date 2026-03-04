@@ -42,11 +42,17 @@ protein_prior ~ normal( as_alphamissense, .05);
 disease_prior ~ normal( as_clinicalSignificance, .05);
 disease_prior ~ normal( as_primateai, .05);
 slope ~ normal( 0, 5 );
+// Weak priors for latent effect-size parameters — ensures proper posterior
+// even when not constrained by the QTL likelihood branch below
+xcest ~ normal(0, 0.2);
+yORest ~ normal(0, 1.0);
 if (numG1 == 0) { // QTL common variants (eQTL or pQTL)
   // // Priors
   xc ~ normal( xcest, xcse);
   yOR ~ normal( yORest, yORse);
-  slope ~ normal(yOR / xc, abs(yORse/xcest));
+  // Guard against division by zero — xc is DATA (0.0 when QTL effect missing)
+  if (abs(xc) > 1e-4)
+    slope ~ normal(yOR / xc, abs(yORse/xcest));
   } 
 else 
 if (numG1 == 1) { // AZ PheWAS rare variants

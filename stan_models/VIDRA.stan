@@ -106,6 +106,11 @@ protein_prior ~ normal( as_alphamissense, .3);
 disease_prior ~ normal( as_clinicalSignificance, .2); 
 // disease_prior ~ normal( as_primateai, .2); // This is very noisy and doesn't add much to the model
 
+// Priors for latent effect-size parameters — ensures proper posterior
+// even when no QTL data is present (e.g. ClinVar-only diseases)
+xcest ~ normal(0, 0.2);
+yORest ~ normal(0, 1.0);
+
 // Intercept prior
 intercept ~ normal(0, 10);
 // Slope prior

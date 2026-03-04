@@ -23,12 +23,19 @@ Output columns:
   mean, median, pct_1, pct_2_5, pct_5, pct_10, pct_25, pct_40, pct_50,
   pct_60, pct_75, pct_90, pct_95, pct_97_5, pct_99, pp_slope_pos, pp_slope_neg
 
-Submit (production):
+Execution model:
+  Phase 1 — Per-gene preprocessing via applyInPandas(groupby as_gene):
+    FoldX per-gene transform, mean imputation, LoF hardcoding, dedup, GWAS filtering
+  Phase 2 — Stan model fitting via applyInPandas(groupby as_gene, as_disease):
+    Each (gene, disease) pair is an independent Spark task → full parallelism
+
+Submit (production — 24h TTL):
   gcloud dataproc batches submit pyspark scripts/pyspark_scripts/run_bayesian_analysis.py \\
     --project=open-targets-genetics-dev --region=europe-west1 \\
     --deps-bucket=gs://vidra-2-0 \\
     --container-image=europe-west1-docker.pkg.dev/open-targets-genetics-dev/opentargets/vidra-spark:v1 \\
-    --properties=spark.sql.execution.arrow.pyspark.enabled=true \\
+    --ttl=86400s \\
+    --properties=spark.sql.execution.arrow.pyspark.enabled=true,spark.executor.instances=20,spark.dynamicAllocation.maxExecutors=50 \\
     -- --bucket_name=vidra-2-0
 
 Submit (test — specific genes only):
@@ -111,6 +118,16 @@ GENE_MEAN_IMPUTE_COLS = [
 # as_plddt: high pLDDT = well-structured region = mutation more consequential → invert.
 INVERSION_COLS = ['as_revel', 'as_polyphen', 'as_cadd',
                   'as_alphamissense', 'as_plddt']
+
+# ADVI configuration.
+# Fullrank ADVI estimates a full P×P covariance over P=4N+8 parameters.
+# For N>100 variants (~408 params), this is O(P²) ≈ 166K entries per
+# iteration and becomes prohibitively slow (hours for N~1000).
+# Above this threshold we skip straight to meanfield (diagonal covariance).
+FULLRANK_MAX_N = 200   # max variants before forcing meanfield
+ADVI_MAX_ITER = 10000  # CmdStan default; explicit for clarity
+ADVI_GRAD_SAMPLES = 20
+ADVI_DRAWS = 1000
 
 # Posterior summary column names (Spark-safe — no special chars)
 POSTERIOR_COLS = [
@@ -269,7 +286,8 @@ def AS_singleVars(df, gene, h1=0.1):
     with tempfile.TemporaryDirectory(prefix='stan_sv_', dir=scratch) as tmpdir:
         fit = model.variational(
             data=df_dict, seed=412, algorithm='fullrank',
-            grad_samples=20, draws=1000,
+            iter=ADVI_MAX_ITER,
+            grad_samples=ADVI_GRAD_SAMPLES, draws=ADVI_DRAWS,
             require_converged=False, show_console=True, refresh=1000,
             output_dir=tmpdir
         )
@@ -339,31 +357,26 @@ def AS_multiVars(df, gene):
     scratch = _get_scratch_dir()
     stan_tmpdir = tempfile.mkdtemp(prefix='stan_mv_', dir=scratch)
 
-    # Try fullrank first; fall back to meanfield if fullrank fails.
-    # Fullrank estimates a full covariance matrix over 4N+8 parameters,
-    # which becomes ill-conditioned for large N (many variants).
-    # Meanfield uses a diagonal covariance and is much more stable.
-    algorithm = 'fullrank'
-    try:
-        fit = model.variational(
-            data=df_dict, seed=412, algorithm=algorithm,
-            grad_samples=20, draws=1000,
-            require_converged=False, show_console=True, refresh=1000,
-            output_dir=stan_tmpdir
-        )
-    except Exception as e_fullrank:
-        print(f"  fullrank failed for {gene} (N={len(df)}): {e_fullrank}; "
-              f"retrying with meanfield...")
-        # Clean up failed output and retry
-        shutil.rmtree(stan_tmpdir, ignore_errors=True)
-        stan_tmpdir = tempfile.mkdtemp(prefix='stan_mv_mf_', dir=scratch)
+    N = len(df)
+
+    # Choose ADVI algorithm based on variant count.
+    # Fullrank estimates a full P×P covariance (P=4N+8 params).
+    # For N>FULLRANK_MAX_N this is prohibitively slow — a single
+    # N=1000 disease can take 4+ hours on fullrank.
+    # Meanfield uses a diagonal covariance and is orders of magnitude faster.
+    if N <= FULLRANK_MAX_N:
+        algorithm = 'fullrank'
+    else:
         algorithm = 'meanfield'
-        fit = model.variational(
-            data=df_dict, seed=412, algorithm=algorithm,
-            grad_samples=20, draws=1000,
-            require_converged=False, show_console=True, refresh=1000,
-            output_dir=stan_tmpdir
-        )
+        print(f"  Using meanfield for {gene} (N={N} > {FULLRANK_MAX_N})")
+
+    fit = model.variational(
+        data=df_dict, seed=412, algorithm=algorithm,
+        iter=ADVI_MAX_ITER,
+        grad_samples=ADVI_GRAD_SAMPLES, draws=ADVI_DRAWS,
+        require_converged=False, show_console=True, refresh=1000,
+        output_dir=stan_tmpdir
+    )
 
     # Extract posterior draws via variational_sample_pd (matches original VIDRA).
     posteriors = fit.variational_sample_pd
@@ -481,40 +494,30 @@ def fitASmodels(disease_df, gene, h1=0.1):
 # Per-gene processing function (runs inside Spark UDF)
 # =============================================================================
 
-def process_gene(gene_df, h1=0.1):
-    """Process all diseases for a single gene.
+def preprocess_gene(gene_df):
+    """Per-gene preprocessing: FoldX transform, mean imputation, dedup, filtering.
+
+    This is Phase 1 of the two-phase approach. It performs all operations that
+    require gene-level context (per-gene mean imputation, FoldX normalisation)
+    and returns the preprocessed DataFrame so that Phase 2 can parallelise
+    Stan fits at the (gene, disease) level.
 
     Steps (matching original VIDRA_estimate_single_gene_linear_bayes.py):
-      1. Fill missing annotation columns with defaults
-      2. Dedup variants within (disease, source, qtl) — keep highest yc
-      3. Filter out single-variant coding GWAS groups (GsourceLab==3)
-      4. For each disease, run single or multi variant model
-      5. Collect and return results
+      1. Compute per-gene FoldX transform
+      2. Fill annotation defaults + per-gene mean imputation + LoF hardcoding
+      3. Dedup variants within (disease, source, qtl) — keep highest yc
+      4. Filter out single-variant coding GWAS groups (GsourceLab==3)
 
     Args:
         gene_df: pandas DataFrame for one gene (all diseases/variants)
-        h1: hyperparameter for Stan models
 
     Returns:
-        pandas DataFrame with posterior summaries per (disease, parameter)
+        pandas DataFrame ready for per-disease Stan fitting
     """
     if gene_df.empty:
-        return pd.DataFrame(columns=ALL_OUTPUT_COLS)
-
-    gene = str(gene_df['as_gene'].iloc[0])
-
-    # Verify models load before doing any processing
-    try:
-        get_models()
-    except Exception as e:
-        import traceback
-        err = f"ModelLoad|{type(e).__name__}: {e}|{traceback.format_exc()[-500:]}"
-        print(f"FATAL: Stan model load failed for {gene}: {err}")
-        return as_error_report(gene_df.iloc[[0]], gene, err)
+        return gene_df
 
     # --- Step 1: Compute per-gene FoldX transform (as_foldx) ---
-    # The FoldX ΔΔG score is normalised per-gene (relative to gene's max).
-    # foldxDdq_raw holds the raw value from FoldX; we transform here.
     if 'foldxDdq_raw' in gene_df.columns:
         foldx_raw = pd.to_numeric(gene_df['foldxDdq_raw'], errors='coerce')
         max_score = foldx_raw.max()
@@ -529,24 +532,15 @@ def process_gene(gene_df, h1=0.1):
             gene_df['as_foldx'] = 1.0
 
     # --- Fill annotation defaults (NON-missense-specific only) ---
-    # Missense-specific columns (SIFT, PolyPhen, REVEL, AlphaMissense,
-    # FoldX) arrive with NaN for non-missense variants — this is
-    # intentional so per-gene mean imputation can work.  Only ensure
-    # the columns exist; fill with NaN if absent.
     _missense_set = set(GENE_MEAN_IMPUTE_COLS)
     for col, default in ANNOTATION_DEFAULTS.items():
         if col in _missense_set:
-            # Just ensure column exists (NaN placeholder); don't fill
             if col not in gene_df.columns:
                 gene_df[col] = float('nan')
         else:
             _fill_annotation(gene_df, col, default)
 
     # --- Per-gene mean imputation for missense-specific annotations ---
-    # For annotations only defined for missense variants (REVEL,
-    # AlphaMissense, etc.), fill NaN with the per-gene mean of observed
-    # values rather than a global benign default. This matches the
-    # original pipeline (pre_processing_VIDRA_per_gene_pheno.py:440).
     for col in GENE_MEAN_IMPUTE_COLS:
         if col in gene_df.columns:
             gene_mean = gene_df[col].mean(skipna=True)
@@ -554,10 +548,6 @@ def process_gene(gene_df, h1=0.1):
                 gene_df[col] = gene_df[col].fillna(gene_mean)
 
     # --- Hardcode LoF variants to maximally damaging (0.0) ---
-    # stop_gained and start_lost variants should have all protein annotations
-    # set to 0 (damaging) because missense-specific tools produce incorrect
-    # benign defaults for them.
-    # Matches original pipeline (pre_processing_VIDRA_per_gene_pheno.py:449).
     if 'most_severe_consequence' in gene_df.columns:
         lof_mask = gene_df['most_severe_consequence'].isin(LOF_CONSEQUENCES)
         if lof_mask.any():
@@ -566,7 +556,6 @@ def process_gene(gene_df, h1=0.1):
                     gene_df.loc[lof_mask, col] = 0.0
 
     # --- Fill remaining NaN in gene-mean-imputed cols with global defaults ---
-    # Catches genes where ALL variants had NaN (no observed values at all).
     for col in GENE_MEAN_IMPUTE_COLS:
         if col in gene_df.columns:
             gene_df[col] = gene_df[col].fillna(
@@ -585,17 +574,14 @@ def process_gene(gene_df, h1=0.1):
     gene_df['GsourceLab'] = gene_df['GsourceLab'].astype(int)
     gene_df['GqtlLab'] = gene_df['GqtlLab'].astype(int)
 
-    # --- Step 2: Dedup within (disease, source, qtl) groups ---
-    # Sort by yc ascending → keep='last' retains highest effect size
-    # (replicates filter_duplecate_lead without needing coloc_ref_dict.pkl)
+    # --- Dedup within (disease, source, qtl) groups ---
     gene_df = gene_df.sort_values('yc')
     gene_df = gene_df.drop_duplicates(
         subset=['variant', 'as_disease', 'GsourceLab', 'GqtlLab'],
         keep='last'
     )
 
-    # --- Step 3: Filter single-variant coding GWAS ---
-    # Original: .filter(lambda x: not ((len(x['variant'])==1) & (x['GsourceLab']==3).all()))
+    # --- Filter single-variant coding GWAS ---
     gene_df = gene_df.groupby(
         ['as_disease', 'GsourceLab', 'GqtlLab'], group_keys=False
     ).filter(
@@ -604,23 +590,49 @@ def process_gene(gene_df, h1=0.1):
         )
     )
 
-    if gene_df.empty:
+    return gene_df
+
+
+def process_disease(disease_df, h1=0.1):
+    """Process a single (gene, disease) pair — Phase 2.
+
+    Runs the appropriate Stan model (single or multi variant) and returns
+    posterior summaries. This function is called via applyInPandas grouped
+    by (as_gene, as_disease), enabling Spark to parallelise across all
+    gene-disease pairs.
+
+    Args:
+        disease_df: pandas DataFrame for one (gene, disease) pair
+        h1: hyperparameter for Stan models
+
+    Returns:
+        pandas DataFrame with posterior summaries
+    """
+    if disease_df.empty:
         return pd.DataFrame(columns=ALL_OUTPUT_COLS)
 
-    # --- Step 4: Run model per disease ---
-    results = gene_df.groupby('as_disease', group_keys=False).apply(
-        lambda x: fitASmodels(x, gene, h1)
-    )
+    gene = str(disease_df['as_gene'].iloc[0])
 
-    if results is None or results.empty:
+    # Verify models load before doing any processing
+    try:
+        get_models()
+    except Exception as e:
+        import traceback
+        err = f"ModelLoad|{type(e).__name__}: {e}|{traceback.format_exc()[-500:]}"
+        print(f"FATAL: Stan model load failed for {gene}: {err}")
+        return as_error_report(disease_df.iloc[[0]], gene, err)
+
+    result = fitASmodels(disease_df, gene, h1)
+
+    if result is None or result.empty:
         return pd.DataFrame(columns=ALL_OUTPUT_COLS)
 
     # Ensure all output columns present (fill missing with None)
     for col in ALL_OUTPUT_COLS:
-        if col not in results.columns:
-            results[col] = None
+        if col not in result.columns:
+            result[col] = None
 
-    return results[ALL_OUTPUT_COLS]
+    return result[ALL_OUTPUT_COLS]
 
 
 # =============================================================================
@@ -785,7 +797,7 @@ def main(args):
 
     # Fill NAs with defaults — but EXCLUDE missense-specific columns.
     # Those must remain NaN so that per-gene mean imputation in
-    # process_gene() can distinguish observed values from missing ones
+    # preprocess_gene() can distinguish observed values from missing ones
     # (matching original pre_processing_VIDRA_per_gene_pheno.py logic).
     _skip_spark_fill = set(GENE_MEAN_IMPUTE_COLS)
     fill_dict = {k: v for k, v in ANNOTATION_DEFAULTS.items()
@@ -797,18 +809,50 @@ def main(args):
           f"(deferred {len(_skip_spark_fill)} missense-specific cols for per-gene imputation)")
 
     # =========================================================================
-    # 4. REPARTITION & RUN STAN MODELS
+    # 4. TWO-PHASE EXECUTION: PREPROCESS PER GENE, THEN FIT PER (GENE, DISEASE)
     # =========================================================================
+    # Phase 1: Per-gene preprocessing (FoldX transform, mean imputation,
+    #          LoF hardcoding, dedup, filtering).  Grouped by as_gene so
+    #          per-gene context (mean, max) is available.  Returns the
+    #          preprocessed DataFrame with same schema (passthrough).
+    # Phase 2: Stan model fitting grouped by (as_gene, as_disease).
+    #          Each (gene, disease) pair is an independent Spark task,
+    #          enabling massive parallelism across all gene-disease pairs.
+    # =========================================================================
+
     n_genes = df.select("as_gene").distinct().count()
     total_rows = df.count()
-    print(f"Ready for Stan: {total_rows} rows across {n_genes} genes")
+    print(f"Ready for preprocessing: {total_rows} rows across {n_genes} genes")
 
-    # Repartition by gene so each gene gets its own Spark task
-    df = df.repartition(n_genes, "as_gene")
+    # --- Phase 1: Per-gene preprocessing via applyInPandas ---
+    # preprocess_gene creates as_foldx from foldxDdq_raw, so we must add
+    # the column to the schema before applyInPandas (Spark requires the
+    # output schema to be declared upfront).
+    if 'as_foldx' not in df.columns:
+        df = df.withColumn('as_foldx', F.lit(None).cast('double'))
 
-    # Run per-gene analysis via applyInPandas (Spark 3.x)
-    results = df.groupby("as_gene").applyInPandas(
-        lambda pdf: process_gene(pdf, h1=h1),
+    preprocess_schema = df.schema
+    df_preprocessed = df.groupby("as_gene").applyInPandas(
+        preprocess_gene,
+        schema=preprocess_schema
+    )
+
+    # Cache the preprocessed data — it's read twice (once for count, once for Stan)
+    df_preprocessed = df_preprocessed.cache()
+    preproc_rows = df_preprocessed.count()
+    n_disease_pairs = df_preprocessed.select("as_gene", "as_disease").distinct().count()
+    print(f"After preprocessing: {preproc_rows} rows, "
+          f"{n_disease_pairs} (gene, disease) pairs")
+
+    # --- Phase 2: Stan model fitting, parallelised by (gene, disease) ---
+    # Repartition by (gene, disease) so each pair becomes its own Spark task.
+    # This distributes work across all available executors rather than
+    # serialising all diseases within a single gene's task.
+    df_preprocessed = df_preprocessed.repartition(
+        max(n_disease_pairs, 1), "as_gene", "as_disease")
+
+    results = df_preprocessed.groupby("as_gene", "as_disease").applyInPandas(
+        lambda pdf: process_disease(pdf, h1=h1),
         schema=result_schema
     )
 
