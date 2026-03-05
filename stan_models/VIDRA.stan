@@ -123,31 +123,30 @@ if (bO[1] != 0) {
   bO ~ normal(intercept_random, bOse);
 }
 
+// Measurement models — applied once for all N variants
+xc ~ normal( xcest, xcse);
+yOR ~ normal( yORest, yORse);
+
 // Posterior for the slope
 // Inspiration for this function comes from here: https://dhemery.github.io/DHE-Modules/technical/sigmoid/
 // and https://dinodini.wordpress.com/2010/04/05/normalized-tunable-sigmoid-functions/
 // The calculation of the sd for the regression comes form Sun et al. 2022 Nature - Genetic associations of protein-coding variants in human disease
 for (n in 1:N) {
   if (numG1[n] == 0) { // Common variants
-    // Priors
-    // Common variants
-    xc ~ normal( xcest, xcse);
-    yOR ~ normal( yORest, yORse);
-    xcest ~ normal( 0, .2);
     if ( numG2[n] == 0 ) { // eQTL
-      yORest[n] ~ student_t( nu, xcest[n] * slope_random[1], abs(yORest[n] / xcest[n]));
+      yORest[n] ~ student_t( nu, xcest[n] * slope_random[1], abs(yOR[n]) / fmax(abs(xc[n]), 0.01));
     } else
     if ( numG2[n] == 1 ) { // pQTL
-      yORest[n] ~ student_t( nu, xcest[n] * slope_random[2], abs(yORest[n] / xcest[n]));
+      yORest[n] ~ student_t( nu, xcest[n] * slope_random[2], abs(yOR[n]) / fmax(abs(xc[n]), 0.01));
       }
     }
   else
   if (numG1[n] == 3) { // common coding GWAS
-    yORest[n] ~ student_t( nu, protein_prior[n] * slope_random[3], abs(yORest[n] / protein_prior[n]) );
+    yORest[n] ~ student_t( nu, protein_prior[n] * slope_random[3], abs(yOR[n] / protein_prior[n]) );
   }
   else
   if (numG1[n] == 1) { // AZ PheWAS
-    yORest[n] ~ student_t( nu, intercept_random + slope_random[4] * protein_prior[n], abs(yORest[n] / protein_prior[n]) );
+    yORest[n] ~ student_t( nu, intercept_random + slope_random[4] * protein_prior[n], abs(yOR[n] / protein_prior[n]) );
   }
   else
   if (numG1[n] == 2) { // Rare variants
