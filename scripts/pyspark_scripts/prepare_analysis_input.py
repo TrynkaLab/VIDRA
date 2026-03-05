@@ -149,7 +149,7 @@ CODING_CONSEQUENCES = [
 ]
 
 # Burden test filters (from original pipeline)
-BURDEN_STAT_METHODS = ['pLoF', 'ptv', 'ptvraredmg']
+BURDEN_STAT_METHODS = ['pLoF', 'ptv', 'ptvraredmg', 'ptv5pcnt']
 BURDEN_COHORTS = ['UK Biobank 450k']
 BURDEN_PROJECTS = ['AstraZeneca PheWAS Portal']
 

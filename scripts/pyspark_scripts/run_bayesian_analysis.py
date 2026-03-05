@@ -277,6 +277,7 @@ def AS_singleVars(df, gene, h1=0.1):
             row.get('as_clinicalSignificance', 0.0)),
         'as_cadd': _safe_float(row.get('as_cadd', 1.0)),
         'as_alphamissense': _safe_float(row.get('as_alphamissense', 1.0)),
+        'as_revel': _safe_float(row.get('as_revel', 1.0)),
         'as_primateai': _safe_float(row.get('as_primateai', 0.0)),
     }
 
@@ -387,7 +388,7 @@ def AS_multiVars(df, gene):
               f"columns: {list(posteriors.columns[:8])}..., "
               f"slope unique values: {len(posteriors['slope'].unique())}/{ len(posteriors)}")
     slope_samples = posteriors['slope'].values
-    intercept_samples = posteriors['intercept'].values
+    intercept_samples = posteriors['intercept_random'].values
     sr_cols = [c for c in posteriors.columns if c.startswith('slope_random[')]
     slope_random_samples = posteriors[sorted(sr_cols)].values  # shape (draws, 5)
 
@@ -673,7 +674,7 @@ def main(args):
 
     ANALYSIS_PATH = f"gs://{args.bucket_name}/vidra_analysis_ready"
     ANNOTATIONS_PATH = f"gs://{args.bucket_name}/variant_annotations"
-    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results"
+    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results_2"
     h1 = float(args.h1)
 
     print("--- VIDRA Bayesian Analysis ---")

@@ -17,6 +17,7 @@ data {
   real as_polyphen;
   real as_cadd;
   real as_alphamissense;
+  real as_revel;
 // // Measure Y - disease risk
 // This are coming from GWAS (including AZ rare-variants one)
   real yOR; // Response variable 
@@ -35,12 +36,12 @@ parameters {
 }
 model {
 // Protein
-protein_prior ~ normal( as_conservation, .05); 
-protein_prior ~ normal( as_cadd, .05); 
-protein_prior ~ normal( as_alphamissense, .05);
+// sd have been calculated on the sd of the different tools in the whole prediction set
+protein_prior ~ normal( as_revel, .28);
+protein_prior ~ normal( as_cadd, .13);
+protein_prior ~ normal( as_alphamissense, .3);
 // Disease
-disease_prior ~ normal( as_clinicalSignificance, .05);
-disease_prior ~ normal( as_primateai, .05);
+disease_prior ~ normal( as_clinicalSignificance, .2);
 slope ~ normal( 0, 5 );
 // Weak priors for latent effect-size parameters — ensures proper posterior
 // even when not constrained by the QTL likelihood branch below
