@@ -2,7 +2,10 @@
 """VIDRA Variant Annotation Pipeline — VEP CLI + local FoldX lookup.
 
 Annotation approach (fully offline, no REST APIs):
-  1. VEP CLI for bulk annotation (~30-60 min for 1.6M variants)
+  1. VEP CLI for bulk annotation (~30-60 min for 1.6M variants with --vep_parallel 4)
+     - Parallel mode (--vep_parallel N): splits variants into N chunks and runs
+       N VEP processes concurrently, each with threads/N forks. Recommended: 4
+       on an 8-core machine. Set to 1 to disable (sequential, ~2.5h).
      - Docker mode (--use_docker): runs inside ensemblorg/ensembl-vep:release_111.0.
        Bio::DB::BigFile is pre-compiled; Conservation plugin works natively.
      - Bare mode (default): VEP installed on host; GERP extracted via pyBigWig.
@@ -56,7 +59,8 @@ Usage (on a GCE VM with VEP installed):
     --vep_cache_dir /opt/vep/cache \\
     --plugin_dir /opt/vep/plugins \\
     --work_dir /tmp/vidra_annotation \\
-    --foldx_file /opt/vep/plugin_data/foldx_energy.csv.gz
+    --foldx_file /opt/vep/plugin_data/foldx_energy.csv.gz \\
+    --vep_parallel 4
 
   # Test mode (500 variants):
   python3 annotate_variants_cli.py \\
@@ -64,7 +68,8 @@ Usage (on a GCE VM with VEP installed):
     --vep_cache_dir /opt/vep/cache \\
     --plugin_dir /opt/vep/plugins \\
     --work_dir /tmp/vidra_annotation \\
-    --foldx_file /opt/vep/plugin_data/foldx_energy.csv.gz
+    --foldx_file /opt/vep/plugin_data/foldx_energy.csv.gz \\
+    --vep_parallel 4
 """
 
 import argparse
@@ -74,6 +79,7 @@ import logging
 import os
 import subprocess
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import gzip
@@ -474,6 +480,155 @@ def run_vep_cli(
                     log.info("  VEP: %s", line.strip())
     except Exception:
         pass
+
+
+def _run_vep_chunk(chunk_args: dict) -> str:
+    """Run VEP on a single chunk of variants. Designed for ProcessPoolExecutor.
+
+    Args:
+        chunk_args: Dict with keys: chunk_id, variants, work_dir, vep_cache_dir,
+                    plugin_dir, plugin_data_dir, threads_per_chunk, buffer_size,
+                    use_docker, docker_image
+
+    Returns:
+        Path to the VEP JSON output file for this chunk.
+    """
+    # Re-configure logging in subprocess
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+    _log = logging.getLogger(f"vep_chunk_{chunk_args['chunk_id']}")
+
+    chunk_id = chunk_args["chunk_id"]
+    variants = chunk_args["variants"]
+    work_dir = Path(chunk_args["work_dir"])
+    vcf_path = work_dir / f"variants_chunk_{chunk_id}.vcf"
+    output_path = work_dir / f"vep_output_chunk_{chunk_id}.json"
+
+    _log.info("Chunk %d: writing %d variants to VCF", chunk_id, len(variants))
+    write_vcf(variants, vcf_path)
+
+    _log.info("Chunk %d: running VEP (%d variants, %d threads)",
+              chunk_id, len(variants), chunk_args["threads_per_chunk"])
+    run_vep_cli(
+        vcf_path=vcf_path,
+        output_path=output_path,
+        vep_cache_dir=chunk_args["vep_cache_dir"],
+        plugin_dir=chunk_args["plugin_dir"],
+        plugin_data_dir=chunk_args["plugin_data_dir"],
+        threads=chunk_args["threads_per_chunk"],
+        buffer_size=chunk_args["buffer_size"],
+        use_docker=chunk_args["use_docker"],
+        docker_image=chunk_args["docker_image"],
+    )
+
+    _log.info("Chunk %d: VEP completed → %s", chunk_id, output_path)
+    return str(output_path)
+
+
+def run_vep_parallel(
+    unique_variants: list[str],
+    work_dir: Path,
+    vep_cache_dir: str,
+    plugin_dir: str,
+    plugin_data_dir: str,
+    threads: int = 8,
+    buffer_size: int = 5000,
+    use_docker: bool = False,
+    docker_image: str = "ensemblorg/ensembl-vep:release_111.0",
+    n_parallel: int = 4,
+) -> pd.DataFrame:
+    """Split variants into chunks and run VEP in parallel, then merge results.
+
+    Each chunk runs as a separate VEP process (Docker container in Docker mode).
+    CPU threads are divided evenly across chunks (e.g., 8 threads / 4 chunks = 2 forks each).
+
+    Args:
+        unique_variants: Sorted list of variant IDs.
+        work_dir: Working directory.
+        vep_cache_dir, plugin_dir, plugin_data_dir: VEP paths.
+        threads: Total CPU threads available.
+        buffer_size: VEP --buffer_size per chunk.
+        use_docker: Run VEP in Docker containers.
+        docker_image: Docker image for VEP.
+        n_parallel: Number of parallel VEP processes.
+
+    Returns:
+        Merged DataFrame from parse_vep_json across all chunks.
+    """
+    n_variants = len(unique_variants)
+    n_parallel = min(n_parallel, n_variants)  # don't create more chunks than variants
+    threads_per_chunk = max(1, threads // n_parallel)
+
+    log.info("Parallel VEP: %d variants → %d chunks (%d threads/chunk)",
+             n_variants, n_parallel, threads_per_chunk)
+
+    # Split variants into roughly equal chunks
+    chunk_size = (n_variants + n_parallel - 1) // n_parallel
+    chunks = []
+    for i in range(n_parallel):
+        start = i * chunk_size
+        end = min(start + chunk_size, n_variants)
+        if start >= n_variants:
+            break
+        chunks.append(unique_variants[start:end])
+
+    log.info("Chunk sizes: %s", [len(c) for c in chunks])
+
+    # Build args for each chunk
+    chunk_args_list = []
+    for i, chunk_variants in enumerate(chunks):
+        chunk_args_list.append({
+            "chunk_id": i,
+            "variants": chunk_variants,
+            "work_dir": str(work_dir),
+            "vep_cache_dir": vep_cache_dir,
+            "plugin_dir": plugin_dir,
+            "plugin_data_dir": plugin_data_dir,
+            "threads_per_chunk": threads_per_chunk,
+            "buffer_size": buffer_size,
+            "use_docker": use_docker,
+            "docker_image": docker_image,
+        })
+
+    # Run chunks in parallel using ProcessPoolExecutor
+    t0 = time.time()
+    output_paths = []
+
+    with ProcessPoolExecutor(max_workers=n_parallel) as executor:
+        futures = {
+            executor.submit(_run_vep_chunk, args): args["chunk_id"]
+            for args in chunk_args_list
+        }
+        for future in as_completed(futures):
+            chunk_id = futures[future]
+            try:
+                result_path = future.result()
+                output_paths.append((chunk_id, result_path))
+                log.info("Chunk %d finished: %s", chunk_id, result_path)
+            except Exception as exc:
+                log.error("Chunk %d FAILED: %s", chunk_id, exc, exc_info=True)
+                raise
+
+    # Sort by chunk_id to maintain order
+    output_paths.sort(key=lambda x: x[0])
+    elapsed = time.time() - t0
+    log.info("All %d VEP chunks completed in %.1fs (vs ~%.1fs sequential estimate)",
+             len(output_paths), elapsed, elapsed * n_parallel)
+
+    # Parse and merge all JSON outputs
+    log.info("Parsing %d VEP JSON outputs...", len(output_paths))
+    dfs = []
+    for chunk_id, path in output_paths:
+        df = parse_vep_json(Path(path))
+        log.info("Chunk %d: %d records parsed", chunk_id, len(df))
+        dfs.append(df)
+
+    merged = pd.concat(dfs, ignore_index=True)
+    log.info("Merged VEP results: %d total records", len(merged))
+    return merged
 
 
 # ============================================================================
@@ -1175,10 +1330,31 @@ def run_pipeline(args):
     vep_output_path = work_dir / "vep_output.json"
     vep_checkpoint = checkpoint_dir / "vep_annotations.parquet"
 
+    n_parallel = getattr(args, 'vep_parallel', 1)
+
     if vep_checkpoint.exists():
         log.info("Loading VEP results from checkpoint: %s", vep_checkpoint)
         vep_df = pd.read_parquet(vep_checkpoint)
         log.info("VEP checkpoint: %d annotations loaded", len(vep_df))
+    elif n_parallel > 1:
+        # --- Step 3+4: Run VEP in parallel and parse ---
+        log.info("Running VEP in parallel mode (%d chunks)", n_parallel)
+        vep_df = run_vep_parallel(
+            unique_variants=unique_variants,
+            work_dir=work_dir,
+            vep_cache_dir=args.vep_cache_dir,
+            plugin_dir=args.plugin_dir,
+            plugin_data_dir=args.plugin_data_dir,
+            threads=args.threads,
+            buffer_size=args.buffer_size,
+            use_docker=getattr(args, 'use_docker', False),
+            docker_image=getattr(args, 'docker_image', 'ensemblorg/ensembl-vep:release_111.0'),
+            n_parallel=n_parallel,
+        )
+
+        # Save checkpoint
+        vep_df.to_parquet(vep_checkpoint, index=False)
+        log.info("VEP checkpoint saved: %s", vep_checkpoint)
     else:
         write_vcf(unique_variants, vcf_path)
 
@@ -1313,6 +1489,14 @@ def main():
         help="Path to ProtVar FoldX energy CSV file (gzipped). "
              "Download from https://ftp.ebi.ac.uk/pub/databases/ProtVar/predictions/stability/ "
              "(default: /opt/vep/plugin_data/foldx_energy.csv.gz)",
+    )
+    parser.add_argument(
+        "--vep_parallel",
+        type=int,
+        default=1,
+        help="Number of parallel VEP processes. Each gets threads/vep_parallel forks. "
+             "Recommended: 4 on an 8-core machine (4 processes × 2 forks). "
+             "Set to 1 to disable parallelism (default: 1).",
     )
     parser.add_argument(
         "--output_name",

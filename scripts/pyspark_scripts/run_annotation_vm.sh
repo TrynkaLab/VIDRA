@@ -17,11 +17,11 @@
 #   bash scripts/pyspark_scripts/run_annotation_vm.sh              # full run + auto-delete
 #   bash scripts/pyspark_scripts/run_annotation_vm.sh --no-delete  # keep VM for debugging
 #
-# Estimated cost: ~$3-8 (e2-standard-8, SSD, ~3-5 hours total)
+# Estimated cost: ~$2-5 (e2-standard-8, SSD, ~1.5-3 hours total)
 # Estimated time breakdown:
 #   - System setup + VEP install:  ~10 min
 #   - Plugin data downloads:       ~30-90 min (CADD ~80GB is the bottleneck)
-#   - VEP CLI annotation:          ~2.5 hrs (1.6M variants, 8 threads)
+#   - VEP CLI annotation:          ~30-60 min (1.6M variants, 4 parallel chunks × 2 forks)
 #   - FoldX local lookup:          ~5 min (1.2M coding variants)
 # =============================================================================
 
@@ -236,6 +236,7 @@ python3 "$VEP_HOME/annotate_variants_cli.py" \
     --use_docker \
     --docker_image ensemblorg/ensembl-vep:release_111.0 \
     --foldx_file "$PLUGIN_DATA/foldx_energy.csv.gz" \
+    --vep_parallel 4 \
     --output_name variant_annotations.parquet \
     2>&1 | tee -a "$LOG"
 
