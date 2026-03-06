@@ -52,7 +52,7 @@ Submit (test — random genes only):
 """
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType, IntegerType
+    StructType, StructField, StringType, DoubleType, IntegerType, BooleanType
 )
 import pandas as pd
 import numpy as np
@@ -140,7 +140,9 @@ POSTERIOR_COLS = [
 META_COLS = ['gene', 'as_disease', 'parameter', 'model',
              'n_variants', 'source', 'qtl']
 
-ALL_OUTPUT_COLS = META_COLS + POSTERIOR_COLS
+BURDEN_COLS = ['has_burden']
+
+ALL_OUTPUT_COLS = META_COLS + POSTERIOR_COLS + BURDEN_COLS
 
 # =============================================================================
 # Global Model Cache (lazy init on worker)
@@ -301,6 +303,7 @@ def AS_singleVars(df, gene, h1=0.1):
     res['qtl'] = str(int(df_dict['numG2']))
     res['model'] = 'single_variant'
     res['parameter'] = 'slope'
+    res['has_burden'] = False
     return pd.DataFrame([res])
 
 
@@ -444,6 +447,7 @@ def AS_multiVars(df, gene):
     output['source'] = sources
     output['qtl'] = qtls
     output['model'] = f'multiple_variant_{algorithm}'
+    output['has_burden'] = float(df['bO'].iloc[0]) != 0.0
 
     # Clean up Stan temp dir
     shutil.rmtree(stan_tmpdir, ignore_errors=True)
@@ -453,6 +457,7 @@ def AS_multiVars(df, gene):
 
 def as_error_report(df, gene, error_msg=""):
     """Return a minimal error row when model fitting fails."""
+    bO_val = float(df['bO'].iloc[0]) if 'bO' in df.columns else 0.0
     return pd.DataFrame([{
         'gene': gene,
         'as_disease': str(df['as_disease'].iloc[0]),
@@ -461,6 +466,7 @@ def as_error_report(df, gene, error_msg=""):
         'parameter': str(error_msg)[:500] if error_msg else 'error',
         'source': str(sorted(set(int(x) for x in df['GsourceLab']))),
         'qtl': str(sorted(set(int(x) for x in df['GqtlLab']))),
+        'has_burden': bO_val != 0.0,
     }])
 
 
@@ -665,6 +671,7 @@ result_schema = StructType([
     StructField("pct_99", DoubleType(), True),
     StructField("pp_slope_pos", DoubleType(), True),
     StructField("pp_slope_neg", DoubleType(), True),
+    StructField("has_burden", BooleanType(), True),
 ])
 
 
