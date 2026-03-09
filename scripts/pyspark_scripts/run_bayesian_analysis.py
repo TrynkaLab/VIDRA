@@ -681,7 +681,7 @@ def main(args):
 
     ANALYSIS_PATH = f"gs://{args.bucket_name}/vidra_analysis_ready"
     ANNOTATIONS_PATH = f"gs://{args.bucket_name}/variant_annotations"
-    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results_2"
+    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results"
     h1 = float(args.h1)
 
     print("--- VIDRA Bayesian Analysis ---")
@@ -864,7 +864,7 @@ def main(args):
         schema=result_schema
     )
 
-    results.write.mode("overwrite").parquet(OUTPUT_PATH)
+    results.coalesce(200).write.mode("overwrite").parquet(OUTPUT_PATH)
 
     n_result_rows = spark.read.parquet(OUTPUT_PATH).count()
     print(f"Analysis complete. {n_result_rows} result rows at {OUTPUT_PATH}")
