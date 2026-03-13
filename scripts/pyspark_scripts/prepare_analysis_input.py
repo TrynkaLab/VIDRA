@@ -5,7 +5,7 @@ that reads all data from GCS and writes analysis-ready parquet partitioned by ge
 
 Pipeline steps:
   0.  Load gene mapping (Ensembl ID <-> Gene Symbol) and study->EFO phenotype map
-  1.  Build AZ EFO phenotype map from OT gene_burden evidence
+  1.  Load AZ EFO phenotype map from curated TSV (az_phewas_to_efo.tsv)
   2.  AZ PheWAS rare variants: allelic model, p<5e-8, gene symbol->ensembl join,
       EFO mapping, SE from log(OR CI). GsourceLab=1, GqtlLab=2.
   3.  ClinVar rare variants: datasourceId=eva, confidence filter, disease mapping.
@@ -21,6 +21,7 @@ Pipeline steps:
 
 Data sources (all read from gs://<bucket>/raw_data/):
   - AZ PheWAS CSV:    raw_data/2022_03_07_azphewas-com-450k-exwas-binary.csv.bz2
+  - AZ EFO curation:  raw_data/az_phewas_to_efo.tsv (curated phenotype-to-EFO mapping)
   - Gene mapping:     raw_data/all_human_protein_coding_genes.csv
   - OT coloc:         raw_data/open_targets/coloc/       (v2d_coloc parquet)
   - OT GWAS:          raw_data/open_targets/gwas/        (sa_gwas parquet)
@@ -58,9 +59,6 @@ Intentional improvements over the original Nextflow pipeline:
 
 Known limitations:
   - VEP annotations: using GERP as the conservation score instead of conservScore from ProtVar.
-  - EFO mapping for AZ phenotypes is derived from the burden evidence table.
-    The original used a manually curated CSV (conversion_table_AZ_phenotypes_EBI_
-    34375979_traits.csv) which may map more phenotypes.
   - QTL effects for common variants come from the coloc table
     (left_var_right_study_beta/se) rather than a separate sa_molecular_trait join.
     These should be near-identical since coloc implies shared causal variants.
@@ -245,26 +243,33 @@ def main(args):
     studies_raw = spark.read.parquet(f"{OT_ROOT}/studies/")
     # Explode trait_efos array to get one row per study_id + EFO
     phenoTab = studies_raw \
-        .select("study_id", F.explode("trait_efos").alias("diseaseFromSourceMappedId")) \
+        .select("study_id", F.explode("trait_efos").alias("diseaseId")) \
         .dropDuplicates()
     print(f"Study-Phenotype Map entries: {phenoTab.count()}")
 
     # =========================================================================
-    # 1. EFO PHENOTYPE MAPPING (from OT gene_burden evidence)
+    # 1. EFO PHENOTYPE MAPPING (from curated TSV)
     # =========================================================================
-    # The OT gene_burden data maps AZ phenotype names (diseaseFromSource)
-    # to EFO IDs (diseaseFromSourceMappedId). We extract this as a lookup.
-    print("Building AZ EFO Phenotype Map...")
-    burden_evidence = spark.read.parquet(f"{OT_ROOT}/burden/")
+    # Curated mapping from AZ PheWAS phenotype strings to EFO disease IDs.
+    # This replaces the previous approach of deriving the mapping from the
+    # OT gene_burden evidence table (which only covered ~7.7% of phenotypes).
+    # The curated file covers ~85% of AZ PheWAS phenotypes.
+    print("Loading AZ EFO Phenotype Map...")
+    efo_curation = spark.read \
+        .option("header", "true") \
+        .option("sep", "\t") \
+        .csv(f"{RAW_ROOT}/az_phewas_to_efo.tsv")
 
-    efo_map = burden_evidence \
-        .filter(F.col("projectId") == "AstraZeneca PheWAS Portal") \
+    efo_map = efo_curation \
+        .filter(F.col("STUDY").contains("AstraZeneca")) \
+        .withColumn("diseaseId",
+                    F.element_at(F.split(F.col("SEMANTIC_TAG"), "/"), -1)) \
         .select(
-            F.col("diseaseFromSource"),
-            F.col("diseaseFromSourceMappedId"),
+            F.col("PROPERTY_VALUE").alias("diseaseFromSource"),
+            F.col("diseaseId"),
         ) \
         .dropDuplicates() \
-        .filter(F.col("diseaseFromSourceMappedId").isNotNull())
+        .filter(F.col("diseaseId").isNotNull())
 
     print(f"EFO Map entries: {efo_map.count()}")
 
@@ -310,12 +315,11 @@ def main(args):
         "left"
     ).drop(efo_map.diseaseFromSource)  # Drop duplicate column
 
-    # Use EFO ID if available; drop rows without EFO mapping (matches original
-    # pipeline which calls dropna(subset=['diseaseFromSourceMappedId'])).
+    # Use EFO ID if available; drop rows without EFO mapping.
     # Raw phenotype names would never match ClinVar/burden (which use EFO IDs).
     az_with_efo = az_with_efo.filter(
-        F.col("diseaseFromSourceMappedId").isNotNull()
-    ).withColumn("as_disease", F.col("diseaseFromSourceMappedId"))
+        F.col("diseaseId").isNotNull()
+    ).withColumn("as_disease", F.col("diseaseId"))
 
     # Harmonise variant IDs: replace hyphens/spaces with underscores
     az_with_efo = az_with_efo.withColumn(
@@ -391,10 +395,7 @@ def main(args):
     clinvar_df = clinvar_with_sig.select(
         F.col("variantId").alias("variant"),
         F.col("targetId").alias("as_gene"),
-        F.coalesce(
-            F.col("diseaseFromSourceMappedId"),
-            F.col("diseaseId")
-        ).alias("as_disease"),
+        F.col("diseaseId").alias("as_disease"),
         F.lit(2).cast("int").alias("GsourceLab"),   # 2 = ClinVar
         F.lit(2).cast("int").alias("GqtlLab"),      # 2 = no_qtl
         # ClinVar has no GWAS effect and no QTL effect — use same defaults as
@@ -490,7 +491,7 @@ def main(args):
     gwas_pval_col = F.col("pval")  # from GWAS table
     qtl_pval_col = F.col("left_var_right_study_pval")
 
-    w_dedup = Window.partitionBy("variantId", "right_gene_id", "diseaseFromSourceMappedId") \
+    w_dedup = Window.partitionBy("variantId", "right_gene_id", "diseaseId") \
         .orderBy(gwas_pval_col.asc(), qtl_pval_col.asc())
     common_deduped = common_with_gwas \
         .withColumn("rn", F.row_number().over(w_dedup)) \
@@ -501,7 +502,7 @@ def main(args):
     common_ready = common_deduped.select(
         F.col("variantId").alias("variant"),
         F.col("right_gene_id").alias("as_gene"),
-        F.col("diseaseFromSourceMappedId").alias("as_disease"),
+        F.col("diseaseId").alias("as_disease"),
         F.lit(0).cast("int").alias("GsourceLab"),  # 0 = common_QTL
         F.when(F.col("right_type") == "eqtl", 0)
          .otherwise(1).cast("int").alias("GqtlLab"),
@@ -589,7 +590,7 @@ def main(args):
 
     # Deduplicate: per (variantId, gene, disease) keep best GWAS pval
     w_cd_gwas = Window.partitionBy(
-        "variantId", "gene_id_prot_coding", "diseaseFromSourceMappedId"
+        "variantId", "gene_id_prot_coding", "diseaseId"
     ).orderBy(F.col("pval").asc())
     coding_gwas_deduped = coding_gwas \
         .withColumn("rn", F.row_number().over(w_cd_gwas)) \
@@ -600,7 +601,7 @@ def main(args):
     coding_gwas_ready = coding_gwas_deduped.select(
         F.col("variantId").alias("variant"),
         F.col("gene_id_prot_coding").alias("as_gene"),
-        F.col("diseaseFromSourceMappedId").alias("as_disease"),
+        F.col("diseaseId").alias("as_disease"),
         F.lit(3).cast("int").alias("GsourceLab"),  # 3 = coding_GWAS
         F.lit(2).cast("int").alias("GqtlLab"),      # 2 = no_qtl
         # GWAS effect
@@ -618,6 +619,7 @@ def main(args):
     # 6. BURDEN TESTS
     # =========================================================================
     print("Loading Burden Tests...")
+    burden_evidence = spark.read.parquet(f"{OT_ROOT}/burden/")
 
     # Filter burden evidence
     burden_filtered = burden_evidence \
@@ -659,11 +661,25 @@ def main(args):
                     (F.log(F.col("oddsRatioCI_Upper_filled")) -
                      F.log(F.col("oddsRatioCI_Lower_filled"))) / 3.92)
 
-    # Use diseaseFromSourceMappedId as the disease key
+    # Map burden phenotypes to EFO IDs using the same curation file as AZ variants.
+    # This ensures burden tests join correctly with AZ variants on disease ID.
+    # Rename efo_map columns to avoid ambiguity with burden evidence's own columns.
+    efo_map_burden = efo_map.select(
+        F.col("diseaseFromSource").alias("_efo_phenotype"),
+        F.col("diseaseId").alias("_efo_disease_id"),
+    )
+    burden_filtered = burden_filtered.join(
+        efo_map_burden,
+        burden_filtered.diseaseFromSource == efo_map_burden._efo_phenotype,
+        "left"
+    ).drop("_efo_phenotype")
+
+    # Prefer curation EFO (aligns with AZ variants), fall back to OT's own
+    # diseaseId (preserves burden for ClinVar/common/coding GWAS matches).
     burden_filtered = burden_filtered.withColumn(
         "disease_key",
-        F.coalesce(F.col("diseaseFromSourceMappedId"), F.col("diseaseId"))
-    )
+        F.coalesce(F.col("_efo_disease_id"), F.col("diseaseId"))
+    ).filter(F.col("disease_key").isNotNull()).drop("_efo_disease_id")
 
     # Keep best burden per gene-disease (lowest pValueExponent)
     w_burden = Window.partitionBy("targetId", "disease_key") \
