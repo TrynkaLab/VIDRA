@@ -75,6 +75,33 @@ gcloud storage rsync \
   --delete-unmatched-destination-objects \
   --billing-project=$PROJECT
 
+# 7. Molecule (OT Platform) - molecule index for drug target mapping
+echo "Copying Molecule Data..."
+gcloud storage rsync \
+  "gs://open-targets-data-releases/24.03/output/etl/parquet/molecule" \
+  "$DEST/molecule" \
+  --recursive \
+  --delete-unmatched-destination-objects \
+  --billing-project=$PROJECT
+
+# 8. Mechanism of Action (OT Platform) - mechanism of action evidence for drug targets
+echo "Copying Mechanism of Action Data..."
+gcloud storage rsync \
+  "gs://open-targets-data-releases/24.03/output/etl/parquet/mechanismOfAction" \
+  "$DEST/mechanismOfAction" \
+  --recursive \
+  --delete-unmatched-destination-objects \
+  --billing-project=$PROJECT
+
+# 9. Targets (OT Platform) - target index for symbol -> ENSG mapping
+echo "Copying Targets Data..."
+gcloud storage rsync \
+  "gs://open-targets-data-releases/24.03/output/etl/parquet/targets" \
+  "$DEST/targets" \
+  --recursive \
+  --delete-unmatched-destination-objects \
+  --billing-project=$PROJECT
+
 echo "All transfers complete!"
 echo ""
 echo "Expected layout:"
@@ -84,3 +111,6 @@ echo "  $DEST/variants/ - variant index (gene_id_prot_coding, consequences)"
 echo "  $DEST/studies/  - study index (study_id -> trait_efos)"
 echo "  $DEST/burden/   - gene burden evidence"
 echo "  $DEST/clinvar/  - ClinVar evidence (eva)"
+echo "  $DEST/molecule/ - molecule index (drug targets)"
+echo "  $DEST/mechanismOfAction/ - mechanism of action evidence"
+echo "  $DEST/targets/  - target index (symbol -> ENSG mapping)"

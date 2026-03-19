@@ -4,7 +4,7 @@ Replaces the original Nextflow + BigQuery pipeline with a single PySpark job
 that reads all data from GCS and writes analysis-ready parquet partitioned by gene.
 
 Pipeline steps:
-  0.  Load gene mapping (Ensembl ID <-> Gene Symbol) and study->EFO phenotype map
+  0.  Load gene mapping (Ensembl ID <-> Gene Symbol) from OT Platform 24.03 targets parquet and study->EFO phenotype map
   1.  Load AZ EFO phenotype map from curated TSV (az_phewas_to_efo.tsv)
   2.  AZ PheWAS rare variants: allelic model, p<5e-8, gene symbol->ensembl join,
       EFO mapping, SE from log(OR CI). GsourceLab=1, GqtlLab=2.
@@ -22,7 +22,7 @@ Pipeline steps:
 Data sources (all read from gs://<bucket>/raw_data/):
   - AZ PheWAS CSV:    raw_data/2022_03_07_azphewas-com-450k-exwas-binary.csv.bz2
   - AZ EFO curation:  raw_data/az_phewas_to_efo.tsv (curated phenotype-to-EFO mapping)
-  - Gene mapping:     raw_data/all_human_protein_coding_genes.csv
+  - Gene mapping:     raw_data/open_targets/targets/ (OT Platform 24.03 target index)
   - OT coloc:         raw_data/open_targets/coloc/       (v2d_coloc parquet)
   - OT GWAS:          raw_data/open_targets/gwas/        (sa_gwas parquet)
   - OT ClinVar:       raw_data/open_targets/clinvar/     (evidence, sourceId=eva)
@@ -222,10 +222,12 @@ def main(args):
     # 0. REFERENCE DATA
     # =========================================================================
     print("Loading Gene Mapping...")
-    gene_map_df = spark.read \
-        .option("header", "false") \
-        .csv(f"{RAW_ROOT}/all_human_protein_coding_genes.csv") \
-        .toDF("ensembl_id", "gene_symbol")
+    gene_map_df = spark.read.parquet(f"{OT_ROOT}/targets/") \
+        .select(
+            F.col("id").alias("ensembl_id"),
+            F.col("approvedSymbol").alias("gene_symbol")
+        ) \
+        .filter(F.col("ensembl_id").isNotNull())
 
     if TEST_MODE:
         # Random sample of N genes (avoid first-N bias toward mitochondrial genes)
