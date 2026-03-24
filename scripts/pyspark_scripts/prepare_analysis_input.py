@@ -4,7 +4,9 @@ Replaces the original Nextflow + BigQuery pipeline with a single PySpark job
 that reads all data from GCS and writes analysis-ready parquet partitioned by gene.
 
 Pipeline steps:
-  0.  Load gene mapping (Ensembl ID <-> Gene Symbol) from OT Platform 24.03 targets parquet and study->EFO phenotype map
+  0.  Load gene mapping (Ensembl ID <-> Gene Symbol) from OT Platform 24.03 targets parquet,
+      build obsolete-to-current EFO remapping from OT Platform 24.03 diseases parquet,
+      and load study->EFO phenotype map
   1.  Load AZ EFO phenotype map from curated TSV (az_phewas_to_efo.tsv)
   2.  AZ PheWAS rare variants: allelic model, p<5e-8, gene symbol->ensembl join,
       EFO mapping, SE from log(OR CI). GsourceLab=1, GqtlLab=2.
@@ -23,6 +25,7 @@ Data sources (all read from gs://<bucket>/raw_data/):
   - AZ PheWAS CSV:    raw_data/2022_03_07_azphewas-com-450k-exwas-binary.csv.bz2
   - AZ EFO curation:  raw_data/az_phewas_to_efo.tsv (curated phenotype-to-EFO mapping)
   - Gene mapping:     raw_data/open_targets/targets/ (OT Platform 24.03 target index)
+  - Disease mapping:  raw_data/open_targets/diseases/ (OT Platform 24.03 disease index, obsoleteTerms)
   - OT coloc:         raw_data/open_targets/coloc/       (v2d_coloc parquet)
   - OT GWAS:          raw_data/open_targets/gwas/        (sa_gwas parquet)
   - OT ClinVar:       raw_data/open_targets/clinvar/     (evidence, sourceId=eva)
@@ -238,7 +241,33 @@ def main(args):
     gene_ensembl_list = gene_map_df.select("ensembl_id")
 
     # =========================================================================
-    # 0b. STUDY -> PHENOTYPE MAPPING (from OT Genetics study index)
+    # 0b. OBSOLETE EFO ID REMAPPING (from OT Platform diseases index)
+    # =========================================================================
+    # The OT diseases parquet has an `obsoleteTerms` array listing old EFO IDs
+    # that have been replaced by each current disease ID. Exploding this gives a
+    # lookup table (old_efo -> current_efo) used to normalise disease IDs across
+    # all sources before any cross-source joins.
+    # This replaces the legacy convert_old_EFOids_toCurrentOnes.csv from the
+    # original Nextflow pipeline.
+    print("Loading Disease EFO Obsolete-to-Current Mapping...")
+    diseases_df = spark.read.parquet(f"{OT_ROOT}/diseases/")
+    efo_remap = diseases_df \
+        .select(
+            F.explode("obsoleteTerms").alias("old_efo"),
+            F.col("id").alias("current_efo"),
+        ) \
+        .dropDuplicates(["old_efo"])
+    print(f"EFO Remap entries: {efo_remap.count()}")
+
+    def apply_efo_remap(df, disease_col):
+        """Replace obsolete EFO IDs in disease_col with their current equivalents."""
+        return df \
+            .join(efo_remap, df[disease_col] == efo_remap["old_efo"], "left") \
+            .withColumn(disease_col, F.coalesce(F.col("current_efo"), F.col(disease_col))) \
+            .drop("old_efo", "current_efo")
+
+    # =========================================================================
+    # 0c. STUDY -> PHENOTYPE MAPPING (from OT Genetics study index)
     # =========================================================================
     # Maps GWAS study_id to EFO disease IDs (trait_efos is an array)
     print("Loading Study -> Phenotype Mapping...")
@@ -247,6 +276,8 @@ def main(args):
     phenoTab = studies_raw \
         .select("study_id", F.explode("trait_efos").alias("diseaseId")) \
         .dropDuplicates()
+    # Remap obsolete EFOs from the 22.09 Genetics study index to current IDs
+    phenoTab = apply_efo_remap(phenoTab, "diseaseId")
     print(f"Study-Phenotype Map entries: {phenoTab.count()}")
 
     # =========================================================================
@@ -322,6 +353,8 @@ def main(args):
     az_with_efo = az_with_efo.filter(
         F.col("diseaseId").isNotNull()
     ).withColumn("as_disease", F.col("diseaseId"))
+    # Remap any obsolete EFO IDs from the curated TSV to current ones
+    az_with_efo = apply_efo_remap(az_with_efo, "as_disease")
 
     # Harmonise variant IDs: replace hyphens/spaces with underscores
     az_with_efo = az_with_efo.withColumn(
@@ -418,6 +451,8 @@ def main(args):
 
     # Drop rows without a mapped disease
     clinvar_df = clinvar_df.filter(F.col("as_disease").isNotNull())
+    # Remap any obsolete EFO IDs from the 24.03 ClinVar evidence to current ones
+    clinvar_df = apply_efo_remap(clinvar_df, "as_disease")
 
     print(f"ClinVar Ready Count: {clinvar_df.count()}")
 
@@ -698,6 +733,8 @@ def main(args):
         F.col("burden_beta").alias("bO"),
         F.col("burden_se").alias("bOse"),
     )
+    # Remap any obsolete EFO IDs from the 22.04 burden evidence to current ones
+    burden_for_join = apply_efo_remap(burden_for_join, "b_disease")
 
     print(f"Burden Tests Ready: {burden_for_join.count()}")
 

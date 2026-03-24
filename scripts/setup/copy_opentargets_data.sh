@@ -102,6 +102,15 @@ gcloud storage rsync \
   --delete-unmatched-destination-objects \
   --billing-project=$PROJECT
 
+# 10. Diseases (OT Platform) - disease index for obsolete EFO ID remapping
+echo "Copying Diseases Data..."
+gcloud storage rsync \
+  "gs://open-targets-data-releases/24.03/output/etl/parquet/diseases" \
+  "$DEST/diseases" \
+  --recursive \
+  --delete-unmatched-destination-objects \
+  --billing-project=$PROJECT
+
 echo "All transfers complete!"
 echo ""
 echo "Expected layout:"
@@ -114,3 +123,4 @@ echo "  $DEST/clinvar/  - ClinVar evidence (eva)"
 echo "  $DEST/molecule/ - molecule index (drug targets)"
 echo "  $DEST/mechanismOfAction/ - mechanism of action evidence"
 echo "  $DEST/targets/  - target index (symbol -> ENSG mapping)"
+echo "  $DEST/diseases/ - disease index (obsolete EFO ID remapping)"
