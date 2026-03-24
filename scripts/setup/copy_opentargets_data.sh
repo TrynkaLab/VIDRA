@@ -56,10 +56,10 @@ gcloud storage rsync \
   --billing-project=$PROJECT
 
 # 5. Burden (Evidence) - gene burden tests from OT Platform
-# Note: Source updated to 22.04 per user request
+# Note: Source updated to 24.03 to align with ClinVar, targets, and diseases
 echo "Copying Burden Data (approx 10MB)..."
 gcloud storage rsync \
-  "gs://open-targets-data-releases/22.04/output/etl/parquet/evidence/sourceId=gene_burden" \
+  "gs://open-targets-data-releases/24.03/output/etl/parquet/evidence/sourceId=gene_burden" \
   "$DEST/burden" \
   --recursive \
   --delete-unmatched-destination-objects \
