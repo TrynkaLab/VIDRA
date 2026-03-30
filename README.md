@@ -57,6 +57,9 @@ bash scripts/pyspark_scripts/run_annotation_vm.sh
 
 # Or, with --no-delete to keep the VM for debugging:
 bash scripts/pyspark_scripts/run_annotation_vm.sh --no-delete
+
+# Isolated run with output suffix (reads/writes suffixed directories):
+bash scripts/pyspark_scripts/run_annotation_vm.sh --suffix=_dev
 ```
 
 To run the annotation script manually on the VM:
@@ -72,6 +75,9 @@ python3 /opt/vidra/annotate_variants_cli.py \
   --foldx_file /opt/vep/plugin_data/foldx_energy.csv.gz \
   --output_name variant_annotations.parquet \
   --threads 8 --buffer_size 5000
+
+# To match a Step 1 suffix, add --output_suffix:
+# ... --output_suffix _dev
 ```
 
 #### Annotation output columns
@@ -134,6 +140,9 @@ gsutil cp my_genes.txt gs://vidra-2-0/my_genes.txt
 
 # Random subset only:
 ... -- --bucket_name=vidra-2-0 --test_mode --test_genes 50
+
+# Isolated run with output suffix (must match Step 1 & 2 suffix):
+... -- --bucket_name=vidra-2-0 --output_suffix=_dev
 ```
 
 **Arguments:**
@@ -145,6 +154,7 @@ gsutil cp my_genes.txt gs://vidra-2-0/my_genes.txt
 | `--gene_list` | — | Path to a GCS text file of ENSG IDs (one per line) to restrict the analysis |
 | `--test_mode` | off | Restrict to a random subset of genes. If `--gene_list` is also set, fills remaining slots randomly up to `--test_genes` |
 | `--test_genes` | `50` | Total number of genes when `--test_mode` is active |
+| `--output_suffix` | `""` | Suffix for input/output directory names (e.g. `_dev`). Must match the suffix used in Steps 1 & 2 |
 
 ---
 
