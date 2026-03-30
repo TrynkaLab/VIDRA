@@ -16,8 +16,8 @@ Pipeline steps:
       study->EFO mapping, dedup by best GWAS then QTL pval. GsourceLab=0.
   5.  Coding GWAS: OT variants (coding consequences), GWAS pval<=5e-8,
       anti-join to exclude coloc variants, dedup. GsourceLab=3, GqtlLab=2.
-  6.  Burden tests: gene_burden evidence, beta->OR conversion for records
-      without oddsRatio, dedup by lowest pValueExponent.
+  6.  Burden tests: raw AZ PheWAS collapsing model data (binary + quantitative),
+      gene symbol->ensembl join, EFO mapping, dedup by lowest pValue.
   7.  Union all 4 variant sources, left-join burden on gene+disease.
   8.  Fill missing values with defaults, write partitioned parquet.
 
@@ -29,7 +29,7 @@ Data sources (all read from gs://<bucket>/raw_data/):
   - OT coloc:         raw_data/open_targets/coloc/       (v2d_coloc parquet)
   - OT GWAS:          raw_data/open_targets/gwas/        (sa_gwas parquet)
   - OT ClinVar:       raw_data/open_targets/clinvar/     (evidence, sourceId=eva)
-  - OT burden:        raw_data/open_targets/burden/      (evidence, sourceId=gene_burden)
+  - AZ PheWAS burden:  raw_data/az_phewas_burden/{binary,quantitative}/ (collapsing model parquet)
   - OT variants:      raw_data/open_targets/variants/    (variant-index parquet)
   - OT studies:       raw_data/open_targets/studies/     (study-index parquet)
 
@@ -51,12 +51,10 @@ Output columns:
 
 Intentional improvements over the original Nextflow pipeline:
   - AZ SE: uses (log(UCI) - log(LCI)) / 3.92 instead of sqrt(50) * (UCI-LCI) / 3.92
-  - Burden SE (bOse): uses (log(UCI) - log(LCI)) / 3.92 — the SE of log(OR), which
-    is the correct sigma for Stan's measurement model bO ~ normal(intercept_random, bOse).
-    The original used raw OR CI (not log-scale) and also multiplied by sqrt(N) to get SD,
-    which is wrong: the measurement model needs SE, not SD.
-  - Burden beta->OR: fills CI from exp(betaCI_Lower/Upper) separately (original
-    used the same formula for both, making UCI-LCI=0)
+  - Burden: uses raw AZ PheWAS collapsing model data (p<0.1) instead of OT Platform
+    gene_burden evidence (pre-filtered to ~p<5e-8). Binary traits use log(OR) scale,
+    quantitative traits use beta directly. SE = (UCI - LCI) / 3.92 on the appropriate
+    scale. This rescues ~35k additional burden tests over the OT pre-filtered data.
   - Coding GWAS: includes 'inframe_deletion' (missing from original's gene-filtered query)
 
 
@@ -149,10 +147,8 @@ CODING_CONSEQUENCES = [
     'inframe_deletion',
 ]
 
-# Burden test filters (from original pipeline)
-BURDEN_STAT_METHODS = ['pLoF', 'ptv', 'ptvraredmg', 'ptv5pcnt']
-BURDEN_COHORTS = ['UK Biobank 450k']
-BURDEN_PROJECTS = ['AstraZeneca PheWAS Portal']
+# Burden test collapsing models (raw AZ PheWAS data, pre-filtered to p<0.1)
+BURDEN_COLLAPSING_MODELS = ['ptv', 'ptv5pcnt', 'ptvraredmg']
 
 # AZ CSV Schema (bzip2 compressed)
 AZ_SCHEMA = StructType([
@@ -215,7 +211,7 @@ def main(args):
     BUCKET = args.bucket_name
     RAW_ROOT = f"gs://{BUCKET}/raw_data"
     OT_ROOT = f"{RAW_ROOT}/open_targets"
-    OUTPUT_ROOT = f"gs://{BUCKET}/vidra_analysis_ready"
+    OUTPUT_ROOT = f"gs://{BUCKET}/vidra_analysis_ready{args.output_suffix}"
     TEST_MODE = args.test_mode
     TEST_GENES = args.test_genes
 
@@ -653,88 +649,104 @@ def main(args):
     print(f"Coding GWAS Ready Count: {coding_gwas_ready.count()}")
 
     # =========================================================================
-    # 6. BURDEN TESTS
+    # 6. BURDEN TESTS (raw AZ PheWAS collapsing model data)
     # =========================================================================
-    print("Loading Burden Tests...")
-    burden_evidence = spark.read.parquet(f"{OT_ROOT}/burden/")
-
-    # Filter burden evidence
-    burden_filtered = burden_evidence \
-        .filter(F.col("cohortId").isin(BURDEN_COHORTS)) \
-        .filter(F.col("projectId").isin(BURDEN_PROJECTS)) \
-        .filter(F.col("statisticalMethod").isin(BURDEN_STAT_METHODS))
-
-    # Filter to our gene list
-    burden_filtered = burden_filtered.join(
-        gene_ensembl_list,
-        burden_filtered.targetId == gene_ensembl_list.ensembl_id,
-        "inner"
-    ).drop(gene_ensembl_list.ensembl_id)  # Drop duplicate column
-
-    # Convert beta to OR where oddsRatio is missing (from original pipeline).
-    # The burden data has EITHER beta or oddsRatio, never both.
-    # Original code: oddsRatio.fillna(np.exp(beta))
-    # For CI: beta records use betaConfidenceInterval{Lower,Upper} to derive SE.
-    burden_filtered = burden_filtered \
-        .withColumn("oddsRatio_filled",
-                    F.coalesce(F.col("oddsRatio"), F.exp(F.col("beta")))) \
-        .withColumn("oddsRatioCI_Lower_filled",
-                    F.coalesce(F.col("oddsRatioConfidenceIntervalLower"),
-                               F.exp(F.col("betaConfidenceIntervalLower")))) \
-        .withColumn("oddsRatioCI_Upper_filled",
-                    F.coalesce(F.col("oddsRatioConfidenceIntervalUpper"),
-                               F.exp(F.col("betaConfidenceIntervalUpper"))))
-
-    # Remove rows still missing oddsRatio after fill (matches original:
-    # df = df.loc[~df.oddsRatio.isna(),:])
-    burden_filtered = burden_filtered.filter(F.col("oddsRatio_filled").isNotNull())
-
-    # Calculate beta and SE from (filled) OR
-    # beta = log(OR)
-    # SE   = (log(UCI) - log(LCI)) / 3.92  — SE of log(OR), correct sigma for Stan measurement model
-    burden_filtered = burden_filtered \
-        .withColumn("burden_beta", F.log(F.col("oddsRatio_filled"))) \
-        .withColumn("burden_se",
-                    (F.log(F.col("oddsRatioCI_Upper_filled")) -
-                     F.log(F.col("oddsRatioCI_Lower_filled"))) / 3.92)
-
-    # Map burden phenotypes to EFO IDs using the same curation file as AZ variants.
-    # This ensures burden tests join correctly with AZ variants on disease ID.
-    # Rename efo_map columns to avoid ambiguity with burden evidence's own columns.
-    efo_map_burden = efo_map.select(
-        F.col("diseaseFromSource").alias("_efo_phenotype"),
-        F.col("diseaseId").alias("_efo_disease_id"),
+    # Uses the full raw AZ PheWAS collapsing model results (binary + quantitative)
+    # instead of the OT Platform gene_burden evidence, which was pre-filtered to
+    # ~p<5e-8 and yielded very few burden pairs. The raw data is pre-filtered by
+    # the provider to p<0.1 and includes ~6.8M gene-disease pairs with EFO mapping.
+    # Even weak burden tests (large SE) are more informative than the default
+    # (bO=0.0, bOse=2.0) since they are at least data-informed.
+    print("Loading Raw AZ PheWAS Burden Tests...")
+    burden_raw = spark.read.option("mergeSchema", "true").parquet(
+        f"{RAW_ROOT}/az_phewas_burden/azphewas-com-450k-phewas-binary/",
+        f"{RAW_ROOT}/az_phewas_burden/azphewas-com-450k-phewas-quantitative/",
     )
-    burden_filtered = burden_filtered.join(
+
+    # Filter to relevant collapsing models
+    burden_filtered = burden_raw.filter(
+        F.col("CollapsingModel").isin(BURDEN_COLLAPSING_MODELS)
+    )
+
+    # Map gene symbols to Ensembl IDs and filter to our gene list
+    burden_mapped = burden_filtered.join(
+        gene_map_df,
+        burden_filtered.Gene == gene_map_df.gene_symbol,
+        "inner"
+    ).drop(gene_map_df.gene_symbol)
+
+    # Map phenotypes to EFO IDs using the FULL curation file (not AstraZeneca-filtered).
+    # The AZ PheWAS phenotype names may be curated under other study labels (e.g.
+    # "LDL direct" is curated under "Genebass", not "AstraZeneca PheWAS Portal").
+    # Using only the AstraZeneca-filtered efo_map would lose ~500 burden pairs.
+    efo_map_burden = efo_curation \
+        .withColumn("_efo_disease_id",
+                    F.element_at(F.split(F.col("SEMANTIC_TAG"), "/"), -1)) \
+        .select(
+            F.col("PROPERTY_VALUE").alias("_efo_phenotype"),
+            F.col("_efo_disease_id"),
+        ) \
+        .dropDuplicates(["_efo_phenotype"]) \
+        .filter(F.col("_efo_disease_id").isNotNull())
+    burden_mapped = burden_mapped.join(
         efo_map_burden,
-        burden_filtered.diseaseFromSource == efo_map_burden._efo_phenotype,
-        "left"
+        burden_mapped.Phenotype == efo_map_burden._efo_phenotype,
+        "inner"
     ).drop("_efo_phenotype")
 
-    # Prefer curation EFO (aligns with AZ variants), fall back to OT's own
-    # diseaseId (preserves burden for ClinVar/common/coding GWAS matches).
-    burden_filtered = burden_filtered.withColumn(
-        "disease_key",
-        F.coalesce(F.col("_efo_disease_id"), F.col("diseaseId"))
-    ).filter(F.col("disease_key").isNotNull()).drop("_efo_disease_id")
+    burden_mapped = burden_mapped.withColumn(
+        "disease_key", F.col("_efo_disease_id")
+    ).drop("_efo_disease_id")
 
-    # Keep best burden per gene-disease (lowest pValueExponent)
-    w_burden = Window.partitionBy("targetId", "disease_key") \
-        .orderBy(F.col("pValueExponent").asc())
-    burden_best = burden_filtered \
+    # Compute burden effect size (bO) and SE (bOse).
+    # Binary and quantitative parquets have different schemas:
+    #   Binary:       BinOddsRatio, BinOddsRatioLCI, BinOddsRatioUCI (raw OR scale)
+    #   Quantitative: beta, LCI, UCI (effect size scale)
+    # Both need to produce log-scale estimates for the Stan model.
+    burden_mapped = burden_mapped \
+        .withColumn("burden_beta",
+            F.when(F.col("Type") == "Quantitative", F.col("beta"))
+             .otherwise(F.log(F.col("BinOddsRatio")))) \
+        .withColumn("burden_se",
+            F.when(F.col("Type") == "Quantitative",
+                   (F.col("UCI") - F.col("LCI")) / 3.92)
+             .otherwise(
+                   (F.log(F.col("BinOddsRatioUCI")) - F.log(F.col("BinOddsRatioLCI"))) / 3.92))
+
+    # Drop rows where effect size or SE could not be computed
+    burden_mapped = burden_mapped.filter(
+        F.col("burden_beta").isNotNull()
+        & F.col("burden_se").isNotNull()
+        & (F.col("burden_se") > 0)
+    )
+
+    # Keep best burden per gene-disease (lowest pValue)
+    w_burden = Window.partitionBy("ensembl_id", "disease_key") \
+        .orderBy(F.col("pValue").asc())
+    burden_best = burden_mapped \
         .withColumn("rn", F.row_number().over(w_burden)) \
         .filter(F.col("rn") == 1) \
         .drop("rn")
 
     # Select burden columns for join
     burden_for_join = burden_best.select(
-        F.col("targetId").alias("b_gene"),
+        F.col("ensembl_id").alias("b_gene"),
         F.col("disease_key").alias("b_disease"),
         F.col("burden_beta").alias("bO"),
         F.col("burden_se").alias("bOse"),
     )
-    # Remap any obsolete EFO IDs from the 22.04 burden evidence to current ones
+    # Remap any obsolete EFO IDs from the curation file to current ones
     burden_for_join = apply_efo_remap(burden_for_join, "b_disease")
+
+    # Dedup again after EFO remap: two different disease_keys may merge into the
+    # same current EFO, creating duplicate (gene, disease) entries that would
+    # multiply variant rows on the left join in Section 8.
+    w_burden_post = Window.partitionBy("b_gene", "b_disease") \
+        .orderBy(F.abs(F.col("bO")).desc())
+    burden_for_join = burden_for_join \
+        .withColumn("rn", F.row_number().over(w_burden_post)) \
+        .filter(F.col("rn") == 1) \
+        .drop("rn")
 
     print(f"Burden Tests Ready: {burden_for_join.count()}")
 
@@ -808,7 +820,7 @@ def main(args):
     final_df.write.mode("overwrite").partitionBy("as_gene").parquet(OUTPUT_ROOT)
 
     # Write a single-file manifest of unique variant IDs for annotate_variants.py
-    manifest_path = f"gs://{args.bucket_name}/vidra_analysis_ready_manifest"
+    manifest_path = f"gs://{args.bucket_name}/vidra_analysis_ready{args.output_suffix}_manifest"
     print("Writing unique variant manifest...")
     final_df.select("variant").distinct().coalesce(1).write.mode("overwrite").parquet(manifest_path)
     print(f"  Variant manifest: {manifest_path}")
@@ -834,5 +846,7 @@ if __name__ == "__main__":
                         help="Run in test mode with limited genes")
     parser.add_argument("--test_genes", type=int, default=50,
                         help="Number of genes to use in test mode (default: 50)")
+    parser.add_argument("--output_suffix", type=str, default="",
+                        help="Suffix for output directory name (e.g. '_dev' -> vidra_analysis_ready_dev)")
     args = parser.parse_args()
     main(args)

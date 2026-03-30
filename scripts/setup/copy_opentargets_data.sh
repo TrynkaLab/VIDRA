@@ -55,15 +55,23 @@ gcloud storage rsync \
   --delete-unmatched-destination-objects \
   --billing-project=$PROJECT
 
-# 5. Burden (Evidence) - gene burden tests from OT Platform
-# Note: Source updated to 24.03 to align with ClinVar, targets, and diseases
-echo "Copying Burden Data (approx 10MB)..."
-gcloud storage rsync \
-  "gs://open-targets-data-releases/24.03/output/etl/parquet/evidence/sourceId=gene_burden" \
-  "$DEST/burden" \
-  --recursive \
-  --delete-unmatched-destination-objects \
-  --billing-project=$PROJECT
+# 5. AZ PheWAS Burden (raw collapsing model data, replaces OT gene_burden)
+# Binary and quantitative parquets have different schemas (BinOddsRatio vs beta).
+# These must be uploaded from local downloads — not available on GCS.
+# Upload with:
+#   gcloud storage cp --recursive /path/to/azphewas-com-450k-phewas-binary/ \
+#     gs://vidra-2-0/raw_data/az_phewas_burden/binary/
+#   gcloud storage cp --recursive /path/to/azphewas-com-450k-phewas-quantitative/ \
+#     gs://vidra-2-0/raw_data/az_phewas_burden/quantitative/
+echo "Checking AZ PheWAS Burden Data..."
+AZ_BURDEN="$BUCKET/raw_data/az_phewas_burden"
+if gcloud storage ls "$AZ_BURDEN/binary/" > /dev/null 2>&1 && \
+   gcloud storage ls "$AZ_BURDEN/quantitative/" > /dev/null 2>&1; then
+  echo "  AZ PheWAS burden data found at $AZ_BURDEN"
+else
+  echo "  WARNING: AZ PheWAS burden data not found at $AZ_BURDEN"
+  echo "  Upload binary/ and quantitative/ parquet directories manually."
+fi
 
 # 6. ClinVar (Evidence) - ClinVar variant evidence from OT Platform
 # Note: Source updated to 24.03 per user request
@@ -118,7 +126,7 @@ echo "  $DEST/coloc/    - colocalisation (v2d_coloc)"
 echo "  $DEST/gwas/     - GWAS summary stats (sa_gwas)"
 echo "  $DEST/variants/ - variant index (gene_id_prot_coding, consequences)"
 echo "  $DEST/studies/  - study index (study_id -> trait_efos)"
-echo "  $DEST/burden/   - gene burden evidence"
+echo "  $BUCKET/raw_data/az_phewas_burden/ - AZ PheWAS collapsing model (binary + quantitative)"
 echo "  $DEST/clinvar/  - ClinVar evidence (eva)"
 echo "  $DEST/molecule/ - molecule index (drug targets)"
 echo "  $DEST/mechanismOfAction/ - mechanism of action evidence"
