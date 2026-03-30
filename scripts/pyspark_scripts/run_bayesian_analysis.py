@@ -121,7 +121,7 @@ INVERSION_COLS = ['as_revel', 'as_polyphen', 'as_cadd',
 
 # ADVI configuration.
 # Fullrank ADVI estimates a full P×P covariance over P=4N+8 parameters.
-# For N>100 variants (~408 params), this is O(P²) ≈ 166K entries per
+# For N>200 variants (~808 params), this is O(P²) ≈ 653K entries per
 # iteration and becomes prohibitively slow (hours for N~1000).
 # Above this threshold we skip straight to meanfield (diagonal covariance).
 FULLRANK_MAX_N = 200   # max variants before forcing meanfield
@@ -679,9 +679,10 @@ def main(args):
     spark = SparkSession.builder.appName("VIDRA_Bayesian_Analysis").getOrCreate()
     from pyspark.sql import functions as F
 
-    ANALYSIS_PATH = f"gs://{args.bucket_name}/vidra_analysis_ready"
-    ANNOTATIONS_PATH = f"gs://{args.bucket_name}/variant_annotations"
-    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results"
+    suffix = getattr(args, 'output_suffix', '')
+    ANALYSIS_PATH = f"gs://{args.bucket_name}/vidra_analysis_ready{suffix}"
+    ANNOTATIONS_PATH = f"gs://{args.bucket_name}/variant_annotations{suffix}"
+    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results{suffix}"
     h1 = float(args.h1)
 
     print("--- VIDRA Bayesian Analysis ---")
@@ -884,5 +885,8 @@ if __name__ == "__main__":
                         help="Number of genes in test mode (default: 50)")
     parser.add_argument("--gene_list", type=str,
                         help="Path to a text file (e.g., gs://bucket/genes.txt) containing ENSG IDs (one per line) to filter the analysis")
+    parser.add_argument("--output_suffix", type=str, default="",
+                        help="Suffix for input/output directory names to match Step 1 suffix "
+                             "(e.g. '_dev' -> vidra_analysis_ready_dev, variant_annotations_dev, vidra_results_dev)")
     args = parser.parse_args()
     main(args)

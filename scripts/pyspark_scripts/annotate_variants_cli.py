@@ -230,11 +230,11 @@ ANNOTATION_DEFAULTS = {
 # Step 1: Read unique variants from GCS manifest
 # ============================================================================
 
-def read_unique_variants(bucket: str) -> list[str]:
+def read_unique_variants(bucket: str, suffix: str = "") -> list[str]:
     """Read unique variant IDs from the manifest parquet on GCS."""
     import gcsfs
     fs = gcsfs.GCSFileSystem()
-    manifest_path = f"{bucket}/vidra_analysis_ready_manifest"
+    manifest_path = f"{bucket}/vidra_analysis_ready{suffix}_manifest"
 
     parquet_files = fs.glob(f"{manifest_path}/*.parquet")
     if not parquet_files:
@@ -1282,19 +1282,21 @@ def write_annotations_to_gcs(
     annotations: pd.DataFrame,
     bucket: str,
     output_name: str = "annotations.parquet",
+    suffix: str = "",
 ) -> None:
     """Write annotation lookup table to GCS as parquet.
 
     Args:
         annotations:  DataFrame to write.
         bucket:       GCS bucket name (without gs://).
-        output_name:  Filename inside gs://<bucket>/variant_annotations/.
+        output_name:  Filename inside gs://<bucket>/variant_annotations<suffix>/.
                       Use a distinct name (e.g. annotations_docker_test.parquet)
                       to avoid overwriting production results during testing.
+        suffix:       Directory suffix to match Step 1 --output_suffix (e.g. '_dev').
     """
     import gcsfs
     fs = gcsfs.GCSFileSystem()
-    output_path = f"{bucket}/variant_annotations/{output_name}"
+    output_path = f"{bucket}/variant_annotations{suffix}/{output_name}"
     log.info("Writing %d annotations to gs://%s", len(annotations), output_path)
     table = pa.Table.from_pandas(annotations, preserve_index=False)
     with fs.open(output_path, "wb") as f:
@@ -1314,7 +1316,8 @@ def run_pipeline(args):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Step 1: Get unique variants ---
-    unique_variants = read_unique_variants(bucket)
+    suffix = getattr(args, 'output_suffix', '')
+    unique_variants = read_unique_variants(bucket, suffix=suffix)
 
     if args.test_mode:
         import random
@@ -1436,7 +1439,7 @@ def run_pipeline(args):
 
     # --- Step 8: Upload to GCS ---
     output_name = getattr(args, 'output_name', 'annotations.parquet')
-    write_annotations_to_gcs(annotations, bucket, output_name)
+    write_annotations_to_gcs(annotations, bucket, output_name, suffix=suffix)
 
     # --- Summary ---
     log.info("=== Annotation Summary ===")
@@ -1446,7 +1449,7 @@ def run_pipeline(args):
         non_default = annotations[col].notna().sum()
         log.info("  %-26s  %d / %d non-null", col, non_default, len(annotations))
 
-    log.info("Done! gs://%s/variant_annotations/%s", bucket, output_name)
+    log.info("Done! gs://%s/variant_annotations%s/%s", bucket, suffix, output_name)
 
 
 def main():
@@ -1501,9 +1504,17 @@ def main():
     parser.add_argument(
         "--output_name",
         default="annotations.parquet",
-        help="Output filename inside gs://<bucket>/variant_annotations/ "
+        help="Output filename inside gs://<bucket>/variant_annotations<suffix>/ "
              "(default: annotations.parquet). Use a distinct name when testing "
              "to avoid overwriting production results.",
+    )
+    parser.add_argument(
+        "--output_suffix",
+        type=str,
+        default="",
+        help="Suffix for input/output directory names to match Step 1 suffix "
+             "(e.g. '_dev' -> reads vidra_analysis_ready_dev_manifest, "
+             "writes variant_annotations_dev/)",
     )
     args = parser.parse_args()
     try:

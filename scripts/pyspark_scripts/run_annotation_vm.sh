@@ -36,10 +36,12 @@ BOOT_DISK_SIZE="250GB"           # VEP cache ~15GB, CADD ~85GB, working space
 BUCKET="vidra-2-0"
 VEP_VERSION="111"
 AUTO_DELETE="true"
+OUTPUT_SUFFIX=""
 
 for arg in "$@"; do
     case "$arg" in
-        --no-delete)  AUTO_DELETE="false" ;;
+        --no-delete)    AUTO_DELETE="false" ;;
+        --suffix=*)     OUTPUT_SUFFIX="${arg#*=}" ;;
     esac
 done
 
@@ -51,6 +53,7 @@ echo "  Machine:      $MACHINE_TYPE"
 echo "  Disk:         $BOOT_DISK_SIZE"
 echo "  VEP version:  $VEP_VERSION"
 echo "  Auto-delete:  $AUTO_DELETE"
+echo "  Suffix:       ${OUTPUT_SUFFIX:-(none)}"
 echo ""
 
 # --- Step 0: Upload scripts to GCS ---
@@ -66,6 +69,7 @@ cat > "$STARTUP_FILE" <<'STARTUP_EOF'
 set -euo pipefail
 
 BUCKET="vidra-2-0"
+OUTPUT_SUFFIX_FLAG="__OUTPUT_SUFFIX_PLACEHOLDER__"
 LOG="/var/log/vidra-annotation.log"
 STATUS_GCS="gs://${BUCKET}/annotation_status/status.txt"
 PLUGIN_DATA="/opt/vep/plugin_data"
@@ -238,6 +242,7 @@ python3 "$VEP_HOME/annotate_variants_cli.py" \
     --foldx_file "$PLUGIN_DATA/foldx_energy.csv.gz" \
     --vep_parallel 4 \
     --output_name variant_annotations.parquet \
+    --output_suffix "$OUTPUT_SUFFIX_FLAG" \
     2>&1 | tee -a "$LOG"
 
 log_msg "Annotation script completed"
@@ -249,7 +254,7 @@ update_status "Uploading logs and finishing"
 gsutil cp "$LOG" "gs://${BUCKET}/annotation_status/annotation_run.log"
 log_msg "Log uploaded to gs://${BUCKET}/annotation_status/annotation_run.log"
 
-update_status "COMPLETED — annotations at gs://${BUCKET}/variant_annotations/"
+update_status "COMPLETED — annotations at gs://${BUCKET}/variant_annotations${OUTPUT_SUFFIX_FLAG}/"
 
 # --- Self-delete if configured ---
 AUTO_DELETE_FLAG="__AUTO_DELETE_PLACEHOLDER__"
@@ -266,6 +271,7 @@ STARTUP_EOF
 
 # Replace the auto-delete placeholder with the actual setting
 sed -i '' "s/__AUTO_DELETE_PLACEHOLDER__/$AUTO_DELETE/g" "$STARTUP_FILE"
+sed -i '' "s/__OUTPUT_SUFFIX_PLACEHOLDER__/$OUTPUT_SUFFIX/g" "$STARTUP_FILE"
 
 # --- Step 2: Create the VM with the startup script ---
 echo "Creating VM: $VM_NAME ..."
