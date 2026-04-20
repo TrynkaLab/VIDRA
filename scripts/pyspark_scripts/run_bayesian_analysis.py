@@ -582,7 +582,9 @@ def preprocess_gene(gene_df):
     gene_df['GqtlLab'] = gene_df['GqtlLab'].astype(int)
 
     # --- Dedup within (disease, source, qtl) groups ---
-    gene_df = gene_df.sort_values('yc')
+    gene_df = gene_df.assign(_abs_yc=gene_df['yc'].abs()).sort_values(
+        ['_abs_yc', 'as_clinicalSignificance']
+    ).drop(columns='_abs_yc')
     gene_df = gene_df.drop_duplicates(
         subset=['variant', 'as_disease', 'GsourceLab', 'GqtlLab'],
         keep='last'

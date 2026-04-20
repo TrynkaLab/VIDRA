@@ -115,12 +115,13 @@ intercept_random ~ normal(0, 10);
 // Slope prior — normal(0, 5) matches single-variant model; slope of ±5 is already extreme (e^5 ≈ 150-fold risk)
 slope ~ normal( 0, 5 );
 slope_random ~ normal( 0, 5 );
-slope_random[5] ~ normal( -1, 5 ); // Rare variants in clinvar are more likely to have negative slope
 
 // Posterior for the intercept
 // if not empty use the following bO prior
+// Use bO[1]/bOse[1] (single observation) — bO/bOse vectors carry the same value for every variant
+// in a gene-disease pair; iterating over all N would shrink the effective SE by sqrt(N).
 if (bO[1] != 0) {
-  bO ~ normal(intercept_random, bOse);
+  bO[1] ~ normal(intercept_random, bOse[1]);
 }
 
 // Measurement models — applied once for all N variants
@@ -142,15 +143,16 @@ for (n in 1:N) {
     }
   else
   if (numG1[n] == 3) { // common coding GWAS
-    yORest[n] ~ student_t( nu, protein_prior[n] * slope_random[3], abs(yOR[n] / protein_prior[n]) );
+    yORest[n] ~ student_t( nu, intercept_random + protein_prior[n] * slope_random[3], abs(yOR[n] / protein_prior[n]) );
   }
   else
   if (numG1[n] == 1) { // AZ PheWAS
     yORest[n] ~ student_t( nu, intercept_random + slope_random[4] * protein_prior[n], abs(yOR[n] / protein_prior[n]) );
   }
   else
-  if (numG1[n] == 2) { // Rare variants
-    disease_prior[n] ~ student_t( nu, intercept_random + slope_random[5] * protein_prior[n], 0.3);
+  if (numG1[n] == 2) { // ClinVar rare variants
+    // inv_logit rescales the log-OR intercept_random to (0,1) to match disease_prior's scale.
+    disease_prior[n] ~ student_t( nu, inv_logit(intercept_random) + slope_random[5] * protein_prior[n], 0.3);
   }
 }
 

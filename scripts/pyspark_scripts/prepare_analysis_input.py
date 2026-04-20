@@ -679,6 +679,9 @@ def main(args):
     # The AZ PheWAS phenotype names may be curated under other study labels (e.g.
     # "LDL direct" is curated under "Genebass", not "AstraZeneca PheWAS Portal").
     # Using only the AstraZeneca-filtered efo_map would lose ~500 burden pairs.
+    # Preserve all (phenotype, EFO) pairs so phenotypes mapping to multiple EFOs
+    # (~4% of the curation file) produce one burden row per EFO synonym — matching
+    # how the rare-variant efo_map (Section 1) handles the same situation.
     efo_map_burden = efo_curation \
         .withColumn("_efo_disease_id",
                     F.element_at(F.split(F.col("SEMANTIC_TAG"), "/"), -1)) \
@@ -686,8 +689,8 @@ def main(args):
             F.col("PROPERTY_VALUE").alias("_efo_phenotype"),
             F.col("_efo_disease_id"),
         ) \
-        .dropDuplicates(["_efo_phenotype"]) \
-        .filter(F.col("_efo_disease_id").isNotNull())
+        .filter(F.col("_efo_disease_id").isNotNull()) \
+        .dropDuplicates()
     burden_mapped = burden_mapped.join(
         efo_map_burden,
         burden_mapped.Phenotype == efo_map_burden._efo_phenotype,
