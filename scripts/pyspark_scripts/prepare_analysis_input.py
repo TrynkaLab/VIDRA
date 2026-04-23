@@ -117,6 +117,13 @@ CLINICAL_SIG_ORDER = [
 ]
 _N_CLIN_CATS = len(CLINICAL_SIG_ORDER) - 1   # 16, denominator for MinMaxScale
 _CLIN_SIG_LOOKUP = {cat: i / _N_CLIN_CATS for i, cat in enumerate(CLINICAL_SIG_ORDER)}
+# OT ClinVar evidence emits "conflicting interpretations of pathogenicity" as
+# a composite clinicalSignificances value (~38k rows). It isn't on the 17-term
+# ordinal above, so without this alias it would fall through to 0.0 (benign),
+# which is the opposite of what conflicting evidence implies. Score it as
+# equivalent to "uncertain significance" — genuinely undetermined.
+_CLIN_SIG_LOOKUP['conflicting interpretations of pathogenicity'] = \
+    _CLIN_SIG_LOOKUP['uncertain significance']
 
 # Blood-related tissues to keep for common QTL variants
 # From original: pre_processing_VIDRA_per_gene_pheno.py
@@ -279,18 +286,22 @@ def main(args):
     # =========================================================================
     # 1. EFO PHENOTYPE MAPPING (from curated TSV)
     # =========================================================================
-    # Curated mapping from AZ PheWAS phenotype strings to EFO disease IDs.
-    # This replaces the previous approach of deriving the mapping from the
-    # OT gene_burden evidence table (which only covered ~7.7% of phenotypes).
-    # The curated file covers ~85% of AZ PheWAS phenotypes.
-    print("Loading AZ EFO Phenotype Map...")
+    # Curated mapping from phenotype strings to EFO disease IDs. Used for both
+    # AZ PheWAS rare variants (Section 2) and AZ PheWAS burden (Section 6).
+    #
+    # We deliberately do NOT filter to STUDY contains "AstraZeneca" here: AZ
+    # phenotype names are sometimes curated under other study labels (e.g.
+    # "LDL direct" is curated under "Genebass"), so filtering would drop valid
+    # mappings for both rare variants and burden. The previous code filtered
+    # here for rare variants only, causing an asymmetry where burden had fuller
+    # coverage than rare variants for the same phenotype strings.
+    print("Loading EFO Phenotype Map...")
     efo_curation = spark.read \
         .option("header", "true") \
         .option("sep", "\t") \
         .csv(f"{RAW_ROOT}/az_phewas_to_efo.tsv")
 
     efo_map = efo_curation \
-        .filter(F.col("STUDY").contains("AstraZeneca")) \
         .withColumn("diseaseId",
                     F.element_at(F.split(F.col("SEMANTIC_TAG"), "/"), -1)) \
         .select(
@@ -474,6 +485,18 @@ def main(args):
         F.col("right_bio_feature").isin(BLOOD_TISSUES)
     )
 
+    # Drop coloc rows where the GWAS lead variant's effect in the QTL study
+    # wasn't propagated by OT (NULL left_var_right_study_beta/se). Without this,
+    # the dedup window's asc() ordering is NULLS FIRST, so a NULL-beta row
+    # silently beats a valid sibling for the same (variant, gene, disease) and
+    # xc ends up as a no-effect sentinel — fabricating a no-QTL data point for
+    # a coloc hit. ~6% of blood-filtered coloc rows; see null_qtl_beta_diagnostic
+    # notebook for impact analysis.
+    coloc_filtered = coloc_filtered.filter(
+        F.col("left_var_right_study_beta").isNotNull()
+        & F.col("left_var_right_study_se").isNotNull()
+    )
+
     print(f"Coloc Filtered Count: {coloc_filtered.count()}")
 
     # Load GWAS summary stats
@@ -525,7 +548,7 @@ def main(args):
     qtl_pval_col = F.col("left_var_right_study_pval")
 
     w_dedup = Window.partitionBy("variantId", "right_gene_id", "diseaseId") \
-        .orderBy(gwas_pval_col.asc(), qtl_pval_col.asc())
+        .orderBy(gwas_pval_col.asc_nulls_last(), qtl_pval_col.asc_nulls_last())
     common_deduped = common_with_gwas \
         .withColumn("rn", F.row_number().over(w_dedup)) \
         .filter(F.col("rn") == 1) \
@@ -542,9 +565,9 @@ def main(args):
         # GWAS effect
         F.col("beta").alias("yc"),
         F.col("se").alias("ycse"),
-        # QTL effect (from coloc table)
-        F.coalesce(F.col("left_var_right_study_beta"), F.lit(0.0)).alias("xc"),
-        F.coalesce(F.col("left_var_right_study_se"), F.lit(0.1)).alias("xcse"),
+        # QTL effect (from coloc table; guaranteed non-null by filter above)
+        F.col("left_var_right_study_beta").alias("xc"),
+        F.col("left_var_right_study_se").alias("xcse"),
         F.lit(0.0).alias("as_clinicalSignificance"),
     )
 
@@ -675,31 +698,16 @@ def main(args):
         "inner"
     ).drop(gene_map_df.gene_symbol)
 
-    # Map phenotypes to EFO IDs using the FULL curation file (not AstraZeneca-filtered).
-    # The AZ PheWAS phenotype names may be curated under other study labels (e.g.
-    # "LDL direct" is curated under "Genebass", not "AstraZeneca PheWAS Portal").
-    # Using only the AstraZeneca-filtered efo_map would lose ~500 burden pairs.
-    # Preserve all (phenotype, EFO) pairs so phenotypes mapping to multiple EFOs
-    # (~4% of the curation file) produce one burden row per EFO synonym — matching
-    # how the rare-variant efo_map (Section 1) handles the same situation.
-    efo_map_burden = efo_curation \
-        .withColumn("_efo_disease_id",
-                    F.element_at(F.split(F.col("SEMANTIC_TAG"), "/"), -1)) \
-        .select(
-            F.col("PROPERTY_VALUE").alias("_efo_phenotype"),
-            F.col("_efo_disease_id"),
-        ) \
-        .filter(F.col("_efo_disease_id").isNotNull()) \
-        .dropDuplicates()
+    # Map phenotypes to EFO IDs using the shared efo_map from Section 1.
+    # Phenotypes mapping to multiple EFOs (~4% of the curation file) produce
+    # one burden row per EFO synonym — matching the rare-variant behaviour.
     burden_mapped = burden_mapped.join(
-        efo_map_burden,
-        burden_mapped.Phenotype == efo_map_burden._efo_phenotype,
+        efo_map,
+        burden_mapped.Phenotype == efo_map.diseaseFromSource,
         "inner"
-    ).drop("_efo_phenotype")
+    ).drop(efo_map.diseaseFromSource)
 
-    burden_mapped = burden_mapped.withColumn(
-        "disease_key", F.col("_efo_disease_id")
-    ).drop("_efo_disease_id")
+    burden_mapped = burden_mapped.withColumnRenamed("diseaseId", "disease_key")
 
     # Compute burden effect size (bO) and SE (bOse).
     # Binary and quantitative parquets have different schemas:
