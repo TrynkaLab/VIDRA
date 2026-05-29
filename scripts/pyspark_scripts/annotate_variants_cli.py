@@ -19,9 +19,15 @@ This script is designed to run on a GCE VM.
 See scripts/pyspark_scripts/run_annotation_vm.sh for the VM orchestration script.
 
 Pipeline position:
-  1. prepare_analysis_input.py → gs://<bucket>/vidra_analysis_ready/
+  1. prepare_analysis_input.py → gs://<bucket>/vidra_analysis_ready/         (+ _manifest)
   2. THIS SCRIPT               → gs://<bucket>/variant_annotations/
   3. run_bayesian_analysis.py   → reads both, joins on 'variant', runs Stan
+
+Suffix control (independent input/output):
+  --input_suffix=X   reads gs://<bucket>/vidra_analysis_ready{X}_manifest/
+  --output_suffix=Y  writes gs://<bucket>/variant_annotations{Y}/<output_name>
+  Leave both empty for production paths. When orchestrated by
+  run_annotation_vm.sh the flags are passed through from the shell wrapper.
 
 VEP CLI plugins used:
   - Blosum62        (built-in)
@@ -65,6 +71,16 @@ Usage (on a GCE VM with VEP installed):
   # Test mode (500 variants):
   python3 annotate_variants_cli.py \\
     --bucket_name vidra-2-0 --test_mode --test_variants 500 \\
+    --vep_cache_dir /opt/vep/cache \\
+    --plugin_dir /opt/vep/plugins \\
+    --work_dir /tmp/vidra_annotation \\
+    --foldx_file /opt/vep/plugin_data/foldx_energy.csv.gz \\
+    --vep_parallel 4
+
+  # Isolated run — independent input + output suffixes:
+  python3 annotate_variants_cli.py \\
+    --bucket_name vidra-2-0 \\
+    --input_suffix=_dev --output_suffix=_dev_v2 \\
     --vep_cache_dir /opt/vep/cache \\
     --plugin_dir /opt/vep/plugins \\
     --work_dir /tmp/vidra_annotation \\
@@ -230,11 +246,11 @@ ANNOTATION_DEFAULTS = {
 # Step 1: Read unique variants from GCS manifest
 # ============================================================================
 
-def read_unique_variants(bucket: str, suffix: str = "") -> list[str]:
+def read_unique_variants(bucket: str, input_suffix: str = "") -> list[str]:
     """Read unique variant IDs from the manifest parquet on GCS."""
     import gcsfs
     fs = gcsfs.GCSFileSystem()
-    manifest_path = f"{bucket}/vidra_analysis_ready{suffix}_manifest"
+    manifest_path = f"{bucket}/vidra_analysis_ready{input_suffix}_manifest"
 
     parquet_files = fs.glob(f"{manifest_path}/*.parquet")
     if not parquet_files:
@@ -1282,21 +1298,21 @@ def write_annotations_to_gcs(
     annotations: pd.DataFrame,
     bucket: str,
     output_name: str = "annotations.parquet",
-    suffix: str = "",
+    output_suffix: str = "",
 ) -> None:
     """Write annotation lookup table to GCS as parquet.
 
     Args:
-        annotations:  DataFrame to write.
-        bucket:       GCS bucket name (without gs://).
-        output_name:  Filename inside gs://<bucket>/variant_annotations<suffix>/.
-                      Use a distinct name (e.g. annotations_docker_test.parquet)
-                      to avoid overwriting production results during testing.
-        suffix:       Directory suffix to match Step 1 --output_suffix (e.g. '_dev').
+        annotations:    DataFrame to write.
+        bucket:         GCS bucket name (without gs://).
+        output_name:    Filename inside gs://<bucket>/variant_annotations<output_suffix>/.
+                        Use a distinct name (e.g. annotations_docker_test.parquet)
+                        to avoid overwriting production results during testing.
+        output_suffix:  Directory suffix for the output (e.g. '_dev').
     """
     import gcsfs
     fs = gcsfs.GCSFileSystem()
-    output_path = f"{bucket}/variant_annotations{suffix}/{output_name}"
+    output_path = f"{bucket}/variant_annotations{output_suffix}/{output_name}"
     log.info("Writing %d annotations to gs://%s", len(annotations), output_path)
     table = pa.Table.from_pandas(annotations, preserve_index=False)
     with fs.open(output_path, "wb") as f:
@@ -1316,8 +1332,9 @@ def run_pipeline(args):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Step 1: Get unique variants ---
-    suffix = getattr(args, 'output_suffix', '')
-    unique_variants = read_unique_variants(bucket, suffix=suffix)
+    input_suffix = getattr(args, 'input_suffix', '')
+    output_suffix = getattr(args, 'output_suffix', '')
+    unique_variants = read_unique_variants(bucket, input_suffix=input_suffix)
 
     if args.test_mode:
         import random
@@ -1439,7 +1456,7 @@ def run_pipeline(args):
 
     # --- Step 8: Upload to GCS ---
     output_name = getattr(args, 'output_name', 'annotations.parquet')
-    write_annotations_to_gcs(annotations, bucket, output_name, suffix=suffix)
+    write_annotations_to_gcs(annotations, bucket, output_name, output_suffix=output_suffix)
 
     # --- Summary ---
     log.info("=== Annotation Summary ===")
@@ -1449,7 +1466,7 @@ def run_pipeline(args):
         non_default = annotations[col].notna().sum()
         log.info("  %-26s  %d / %d non-null", col, non_default, len(annotations))
 
-    log.info("Done! gs://%s/variant_annotations%s/%s", bucket, suffix, output_name)
+    log.info("Done! gs://%s/variant_annotations%s/%s", bucket, output_suffix, output_name)
 
 
 def main():
@@ -1509,12 +1526,18 @@ def main():
              "to avoid overwriting production results.",
     )
     parser.add_argument(
+        "--input_suffix",
+        type=str,
+        default="",
+        help="Suffix for the input manifest directory "
+             "(e.g. '_dev' -> reads vidra_analysis_ready_dev_manifest/).",
+    )
+    parser.add_argument(
         "--output_suffix",
         type=str,
         default="",
-        help="Suffix for input/output directory names to match Step 1 suffix "
-             "(e.g. '_dev' -> reads vidra_analysis_ready_dev_manifest, "
-             "writes variant_annotations_dev/)",
+        help="Suffix for the output annotations directory "
+             "(e.g. '_dev' -> writes variant_annotations_dev/).",
     )
     args = parser.parse_args()
     try:

@@ -36,8 +36,16 @@ Data sources (all read from gs://<bucket>/raw_data/):
   See scripts/copy_opentargets_data.sh for how to copy OT data into the bucket.
 
 Output:
-  gs://<bucket>/vidra_analysis_ready/   (parquet, partitioned by as_gene)
-  Consumed by: scripts/pyspark_scripts/run_bayesian_analysis.py
+  gs://<bucket>/vidra_analysis_ready<output_suffix>/         (parquet, partitioned by as_gene)
+  gs://<bucket>/vidra_analysis_ready<output_suffix>_manifest/ (variant list for Step 2 annotation)
+
+  --output_suffix (default "") isolates this run from production paths. Pass
+  the same value to Step 3 via --analysis_suffix when reading. Pass the
+  manifest suffix to Step 2 via --input_suffix.
+
+  Consumed by:
+    Step 2 — scripts/pyspark_scripts/annotate_variants_cli.py (reads the manifest)
+    Step 3 — scripts/pyspark_scripts/run_bayesian_analysis.py (reads the partitioned table)
 
 Output columns:
   variant, as_gene, as_disease, GsourceLab, GqtlLab,

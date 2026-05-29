@@ -17,6 +17,16 @@
 #   bash scripts/pyspark_scripts/run_annotation_vm.sh              # full run + auto-delete
 #   bash scripts/pyspark_scripts/run_annotation_vm.sh --no-delete  # keep VM for debugging
 #
+# Suffix control (independent input/output):
+#   --input_suffix=X    reads gs://vidra-2-0/vidra_analysis_ready{X}_manifest/
+#   --output_suffix=Y   writes gs://vidra-2-0/variant_annotations{Y}/
+#   --suffix=Z          backwards-compat shortcut: sets BOTH input_suffix and output_suffix to Z
+#
+# Example: re-annotate the dev manifest into a fresh annotations dir without
+# overwriting the prior run's annotations:
+#   bash scripts/pyspark_scripts/run_annotation_vm.sh \
+#     --input_suffix=_dev --output_suffix=_dev_v2
+#
 # Estimated cost: ~$2-5 (e2-standard-8, SSD, ~1.5-3 hours total)
 # Estimated time breakdown:
 #   - System setup + VEP install:  ~10 min
@@ -36,24 +46,38 @@ BOOT_DISK_SIZE="250GB"           # VEP cache ~15GB, CADD ~85GB, working space
 BUCKET="vidra-2-0"
 VEP_VERSION="111"
 AUTO_DELETE="true"
+INPUT_SUFFIX=""
 OUTPUT_SUFFIX=""
+COMBINED_SUFFIX_SET="false"
 
 for arg in "$@"; do
     case "$arg" in
-        --no-delete)    AUTO_DELETE="false" ;;
-        --suffix=*)     OUTPUT_SUFFIX="${arg#*=}" ;;
+        --no-delete)        AUTO_DELETE="false" ;;
+        --input_suffix=*)   INPUT_SUFFIX="${arg#*=}" ;;
+        --output_suffix=*)  OUTPUT_SUFFIX="${arg#*=}" ;;
+        --suffix=*)
+            # Backwards-compat: --suffix sets BOTH input and output.
+            INPUT_SUFFIX="${arg#*=}"
+            OUTPUT_SUFFIX="${arg#*=}"
+            COMBINED_SUFFIX_SET="true"
+            ;;
     esac
 done
 
+if [[ "$COMBINED_SUFFIX_SET" == "true" ]] && { [[ -n "$INPUT_SUFFIX" && "$INPUT_SUFFIX" != "$OUTPUT_SUFFIX" ]] || [[ -n "$OUTPUT_SUFFIX" && "$INPUT_SUFFIX" != "$OUTPUT_SUFFIX" ]]; }; then
+    echo "WARNING: --suffix combined with --input_suffix or --output_suffix; --suffix wins." >&2
+fi
+
 echo "=== VIDRA Annotation VM ==="
-echo "  Project:      $PROJECT"
-echo "  Zone:         $ZONE"
-echo "  VM:           $VM_NAME"
-echo "  Machine:      $MACHINE_TYPE"
-echo "  Disk:         $BOOT_DISK_SIZE"
-echo "  VEP version:  $VEP_VERSION"
-echo "  Auto-delete:  $AUTO_DELETE"
-echo "  Suffix:       ${OUTPUT_SUFFIX:-(none)}"
+echo "  Project:        $PROJECT"
+echo "  Zone:           $ZONE"
+echo "  VM:             $VM_NAME"
+echo "  Machine:        $MACHINE_TYPE"
+echo "  Disk:           $BOOT_DISK_SIZE"
+echo "  VEP version:    $VEP_VERSION"
+echo "  Auto-delete:    $AUTO_DELETE"
+echo "  Input suffix:   ${INPUT_SUFFIX:-(none)}"
+echo "  Output suffix:  ${OUTPUT_SUFFIX:-(none)}"
 echo ""
 
 # --- Step 0: Upload scripts to GCS ---
@@ -69,6 +93,7 @@ cat > "$STARTUP_FILE" <<'STARTUP_EOF'
 set -euo pipefail
 
 BUCKET="vidra-2-0"
+INPUT_SUFFIX_FLAG="__INPUT_SUFFIX_PLACEHOLDER__"
 OUTPUT_SUFFIX_FLAG="__OUTPUT_SUFFIX_PLACEHOLDER__"
 LOG="/var/log/vidra-annotation.log"
 STATUS_GCS="gs://${BUCKET}/annotation_status/status.txt"
@@ -242,6 +267,7 @@ python3 "$VEP_HOME/annotate_variants_cli.py" \
     --foldx_file "$PLUGIN_DATA/foldx_energy.csv.gz" \
     --vep_parallel 4 \
     --output_name variant_annotations.parquet \
+    --input_suffix "$INPUT_SUFFIX_FLAG" \
     --output_suffix "$OUTPUT_SUFFIX_FLAG" \
     2>&1 | tee -a "$LOG"
 
@@ -271,6 +297,7 @@ STARTUP_EOF
 
 # Replace the auto-delete placeholder with the actual setting
 sed -i '' "s/__AUTO_DELETE_PLACEHOLDER__/$AUTO_DELETE/g" "$STARTUP_FILE"
+sed -i '' "s/__INPUT_SUFFIX_PLACEHOLDER__/$INPUT_SUFFIX/g" "$STARTUP_FILE"
 sed -i '' "s/__OUTPUT_SUFFIX_PLACEHOLDER__/$OUTPUT_SUFFIX/g" "$STARTUP_FILE"
 
 # --- Step 2: Create the VM with the startup script ---

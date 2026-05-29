@@ -6,28 +6,65 @@ and normalisations, then runs per-(gene, disease) Bayesian hierarchical models
 via CmdStanPy variational inference and writes posterior summaries to parquet.
 
 Pipeline position:
-  1. prepare_analysis_input.py → gs://<bucket>/vidra_analysis_ready/  (1 file per gene)
-  2. annotate_variants_cli.py  → gs://<bucket>/variant_annotations/   (38 MB parquet)
-  3. THIS SCRIPT               → gs://<bucket>/vidra_results/
+  1. prepare_analysis_input.py → gs://<bucket>/vidra_analysis_ready/        (1 file per gene)
+  2. annotate_variants_cli.py  → gs://<bucket>/variant_annotations/         (38 MB parquet)
+  3. THIS SCRIPT               → gs://<bucket>/vidra_results/                 (always)
+                                  gs://<bucket>/stan_inputs/                  (--save_stan_inputs)
+                                  gs://<bucket>/vidra_variant_results/        (--save_variant_outputs)
+
+Suffix control (each path is independently addressable so you can swap one
+input without rebuilding everything — e.g. tweak annotations only):
+  --analysis_suffix=X     reads gs://<bucket>/vidra_analysis_ready{X}/
+  --annotations_suffix=Y  reads gs://<bucket>/variant_annotations{Y}/
+  --output_suffix=Z       writes gs://<bucket>/vidra_results{Z}/  (and the
+                          two debug paths when their flags are set)
 
 When using --gene_list, Spark reads ONLY the requested gene partitions via
 literal .isin() filter (guaranteed partition pruning — no 300-executor overhead).
-The 38 MB annotation table is broadcast-joined automatically by Spark.
+The annotation table is broadcast-joined automatically by Spark.
+--gene_list and --test_mode are applied BEFORE any preprocessing, so the
+debug outputs (stan_inputs, vidra_variant_results) only contain rows for the
+filtered gene set.
 
 Stan models (compiled in Docker image):
   - VIDRA.stan: multi-variant hierarchical model with slope_random[1..5] per source
   - VIDRA_single_variant.stan: single-variant model with one slope parameter
+  Both declare four per-variant latent parameters: xcest, yORest,
+  protein_prior, disease_prior (all four are extracted by --save_variant_outputs).
 
-Output columns:
+Output columns (gs://<bucket>/vidra_results<output_suffix>/):
   gene, as_disease, parameter, model, n_variants, source, qtl,
   mean, median, pct_1, pct_2_5, pct_5, pct_10, pct_25, pct_40, pct_50,
-  pct_60, pct_75, pct_90, pct_95, pct_97_5, pct_99, pp_slope_pos, pp_slope_neg
+  pct_60, pct_75, pct_90, pct_95, pct_97_5, pct_99, pp_slope_pos, pp_slope_neg,
+  has_burden
+  Where `parameter` ∈ {'slope', 'intercept', 'slope_random[1..5]', 'meta_slope'}
+  for gene-disease summary rows; 'error_report' rows carry the Stan exception
+  message in the `parameter` column.
+
+Debug output schemas (opt-in):
+  --save_stan_inputs → gs://<bucket>/stan_inputs<output_suffix>/, partitioned
+    by as_gene. Holds the exact per-variant DataFrame fed into Stan, AFTER
+    annotation join, 1-x inversions on INVERSION_COLS, per-gene mean imputation
+    of GENE_MEAN_IMPUTE_COLS, LoF hardcoding, and dedup. One row per (variant,
+    gene, disease) Stan input observation.
+
+  --save_variant_outputs → gs://<bucket>/vidra_variant_results<output_suffix>/.
+    Runs a SECOND applyInPandas pass over the cached df_preprocessed (re-fits
+    Stan), extracting per-variant posterior summaries for xcest, yORest,
+    protein_prior, disease_prior. Four rows per variant per (gene, disease)
+    — same posterior summary columns as the gene-disease results, with an
+    extra `variant` column and `parameter` ∈ {'xcest', 'yORest',
+    'protein_prior', 'disease_prior'}. Stan errors are not emitted here;
+    vidra_results/ remains authoritative for error_report rows. Roughly
+    doubles runtime since Stan is re-fit per (gene, disease).
 
 Execution model:
   Phase 1 — Per-gene preprocessing via applyInPandas(groupby as_gene):
     FoldX per-gene transform, mean imputation, LoF hardcoding, dedup, GWAS filtering
   Phase 2 — Stan model fitting via applyInPandas(groupby as_gene, as_disease):
     Each (gene, disease) pair is an independent Spark task → full parallelism
+  Phase 3 (--save_variant_outputs only) — second applyInPandas with the same
+    grouping that re-fits Stan and returns per-variant rows.
 
 Submit (production — 24h TTL):
   gcloud dataproc batches submit pyspark scripts/pyspark_scripts/run_bayesian_analysis.py \\
@@ -49,6 +86,19 @@ Submit (test — specific genes + random padding to N total):
 
 Submit (test — random genes only):
   ... same as above ... -- --bucket_name=vidra-2-0 --test_mode --test_genes 50
+
+Submit (isolated run — three independent suffixes):
+  ... same as above ... -- --bucket_name=vidra-2-0 \\
+    --analysis_suffix=_dev --annotations_suffix=_dev --output_suffix=_dev
+
+Submit (re-annotation iteration — reuse Step 1 output, new annotations, new results dir):
+  ... same as above ... -- --bucket_name=vidra-2-0 \\
+    --analysis_suffix="" --annotations_suffix=_newannot --output_suffix=_newannot_results
+
+Submit (debug — capture Stan inputs and per-variant fitted values for a small gene set):
+  ... same as above ... -- --bucket_name=vidra-2-0 \\
+    --gene_list=gs://vidra-2-0/my_genes.txt \\
+    --output_suffix=_audit --save_stan_inputs --save_variant_outputs
 """
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
@@ -144,6 +194,12 @@ BURDEN_COLS = ['has_burden']
 
 ALL_OUTPUT_COLS = META_COLS + POSTERIOR_COLS + BURDEN_COLS
 
+# Per-variant output columns (used when --save_variant_outputs is set).
+# Same posterior summary stats, but with an extra `variant` column and
+# `parameter` ∈ {'xcest', 'yORest'} instead of 'slope'/'intercept'/etc.
+VARIANT_META_COLS = META_COLS + ['variant']
+ALL_VARIANT_OUTPUT_COLS = VARIANT_META_COLS + POSTERIOR_COLS + BURDEN_COLS
+
 # =============================================================================
 # Global Model Cache (lazy init on worker)
 # =============================================================================
@@ -224,6 +280,56 @@ def _get_slope_key(combination_slope, value_to_find):
     return None
 
 
+def _extract_variant_posterior_rows(posteriors, df, multi_variant):
+    """Build per-variant posterior summary rows for all per-variant latent params.
+
+    The Stan models declare four per-variant latent parameters:
+      - xcest[n]          — latent QTL effect (drives the eQTL/pQTL branch)
+      - yORest[n]         — latent GWAS effect (drives all branches)
+      - protein_prior[n]  — latent protein-function score (drives the coding-GWAS,
+                            AZ-rare, ClinVar-rare branches; informed by REVEL/CADD/
+                            AlphaMissense annotations)
+      - disease_prior[n]  — latent disease-pathogenicity score (used in ClinVar
+                            branch; informed by clinicalSignificance)
+
+    Saving all four lets a reader reconstruct which branch of the model each
+    variant traversed: QTL variants are constrained by xc/yOR (so xcest/yORest
+    are meaningful), while rare/coding variants are constrained by
+    protein_prior/disease_prior derived from annotations.
+
+    Args:
+        posteriors: pandas DataFrame from fit.variational_sample_pd
+                    (rows = draws, columns are bracket-indexed for multi-variant,
+                    scalar names for single-variant — both 1-indexed in Stan).
+        df:         pandas DataFrame whose row order matches the Stan input
+                    order. Row i-1 of df corresponds to <param>[i].
+        multi_variant: True for the multi-variant model (vector parameters),
+                       False for the single-variant model (scalar parameters).
+
+    Returns a list of dicts (one per (variant, parameter) pair); each dict
+    holds the per-variant posterior summary stats plus a 'variant' and
+    'parameter' field. Caller is responsible for tagging metadata columns.
+    """
+    param_names = ('xcest', 'yORest', 'protein_prior', 'disease_prior')
+    rows = []
+    n = len(df)
+    for i in range(n):
+        variant_id = str(df['variant'].iloc[i])
+        source_val = str(int(df['GsourceLab'].iloc[i]))
+        qtl_val = str(int(df['GqtlLab'].iloc[i]))
+        for parameter in param_names:
+            col = f'{parameter}[{i + 1}]' if multi_variant else parameter
+            if col not in posteriors.columns:
+                continue
+            stats = clean_posteriorForAs(posteriors[col].values)
+            stats['parameter'] = parameter
+            stats['variant'] = variant_id
+            stats['source'] = source_val
+            stats['qtl'] = qtl_val
+            rows.append(stats)
+    return rows
+
+
 def _safe_float(val, default=0.0):
     """Convert to float, replacing NaN/None/inf with default."""
     try:
@@ -246,16 +352,19 @@ def _fill_annotation(df, col, default=0.0):
 # Stan model runners
 # =============================================================================
 
-def AS_singleVars(df, gene, h1=0.1):
+def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
     """Run single-variant Stan model (VIDRA_single_variant.stan).
 
     Args:
         df: pandas DataFrame with one row per variant (typically 1 row)
         gene: gene identifier string
         h1: hyperparameter (default 0.1)
+        return_variant_outputs: if True, return per-variant posterior
+            summaries for xcest/yORest instead of the gene-disease slope.
 
     Returns:
-        pandas DataFrame with one row of posterior summaries, or None on failure.
+        pandas DataFrame with posterior summaries, or None on failure.
+        Schema depends on return_variant_outputs.
     """
     model = get_models()['single']
     if len(df) == 0:
@@ -294,20 +403,42 @@ def AS_singleVars(df, gene, h1=0.1):
             require_converged=False, show_console=True, refresh=1000,
             output_dir=tmpdir
         )
-        slope_posteriors = fit.stan_variable('slope', mean=False)
+        if return_variant_outputs:
+            posteriors = fit.variational_sample_pd
+        else:
+            slope_posteriors = fit.stan_variable('slope', mean=False)
+
+    source_str = str(int(df_dict['numG1']))
+    qtl_str = str(int(df_dict['numG2']))
+    n_variants = int(df['variant'].nunique())
+    as_disease = str(df['as_disease'].iloc[0])
+
+    if return_variant_outputs:
+        variant_rows = _extract_variant_posterior_rows(
+            posteriors, df, multi_variant=False)
+        if not variant_rows:
+            return None
+        out = pd.DataFrame(variant_rows)
+        out['gene'] = gene
+        out['as_disease'] = as_disease
+        out['n_variants'] = n_variants
+        out['model'] = 'single_variant'
+        out['has_burden'] = False
+        return out
+
     res = clean_posteriorForAs(slope_posteriors)
     res['gene'] = gene
-    res['as_disease'] = str(df['as_disease'].iloc[0])
-    res['n_variants'] = int(df['variant'].nunique())
-    res['source'] = str(int(df_dict['numG1']))
-    res['qtl'] = str(int(df_dict['numG2']))
+    res['as_disease'] = as_disease
+    res['n_variants'] = n_variants
+    res['source'] = source_str
+    res['qtl'] = qtl_str
     res['model'] = 'single_variant'
     res['parameter'] = 'slope'
     res['has_burden'] = False
     return pd.DataFrame([res])
 
 
-def AS_multiVars(df, gene):
+def AS_multiVars(df, gene, return_variant_outputs=False):
     """Run multi-variant Stan model (VIDRA.stan).
 
     Faithfully replicates the original meta-slope extraction logic:
@@ -319,9 +450,13 @@ def AS_multiVars(df, gene):
     Args:
         df: pandas DataFrame with multiple variant rows for one disease
         gene: gene identifier string
+        return_variant_outputs: if True, return per-variant posterior
+            summaries for xcest[i]/yORest[i] instead of the gene-disease
+            slope/intercept/meta_slope/slope_random rows.
 
     Returns:
-        pandas DataFrame with one row per parameter, or None on failure.
+        pandas DataFrame with posterior summaries, or None on failure.
+        Schema depends on return_variant_outputs.
     """
     model = get_models()['multi']
 
@@ -390,6 +525,22 @@ def AS_multiVars(df, gene):
         print(f"[DIAG] variational_sample_pd shape: {posteriors.shape}, "
               f"columns: {list(posteriors.columns[:8])}..., "
               f"slope unique values: {len(posteriors['slope'].unique())}/{ len(posteriors)}")
+
+    # Per-variant output path: extract xcest[i]/yORest[i] summaries and return early.
+    if return_variant_outputs:
+        variant_rows = _extract_variant_posterior_rows(
+            posteriors, df, multi_variant=True)
+        shutil.rmtree(stan_tmpdir, ignore_errors=True)
+        if not variant_rows:
+            return None
+        out = pd.DataFrame(variant_rows)
+        out['gene'] = gene
+        out['as_disease'] = str(df['as_disease'].iloc[0])
+        out['n_variants'] = int(df['variant'].nunique())
+        out['model'] = f'multiple_variant_{algorithm}'
+        out['has_burden'] = float(df['bO'].iloc[0]) != 0.0
+        return out
+
     slope_samples = posteriors['slope'].values
     intercept_samples = posteriors['intercept_random'].values
     sr_cols = [c for c in posteriors.columns if c.startswith('slope_random[')]
@@ -470,30 +621,41 @@ def as_error_report(df, gene, error_msg=""):
     }])
 
 
-def fitASmodels(disease_df, gene, h1=0.1):
+def fitASmodels(disease_df, gene, h1=0.1, save_variant_outputs=False):
     """Decide single vs multi variant model and fit.
 
     Args:
         disease_df: DataFrame for ONE disease within a gene
         gene: gene identifier
         h1: hyperparameter
+        save_variant_outputs: when True, return per-variant xcest/yORest
+            posterior summaries (one row per variant per parameter) instead
+            of the gene-disease-level posterior rows. On error, returns an
+            empty DataFrame (variant-output stream has no error_report rows;
+            errors continue to live in vidra_results/).
 
     Returns:
-        DataFrame of posterior summaries
+        DataFrame of posterior summaries (schema depends on save_variant_outputs).
     """
     n_unique_variants = disease_df['variant'].nunique()
     try:
         if n_unique_variants > 1:
-            result = AS_multiVars(disease_df, gene)
+            result = AS_multiVars(disease_df, gene,
+                                  return_variant_outputs=save_variant_outputs)
         else:
-            result = AS_singleVars(disease_df, gene, h1)
+            result = AS_singleVars(disease_df, gene, h1,
+                                   return_variant_outputs=save_variant_outputs)
         if result is None or result.empty:
+            if save_variant_outputs:
+                return pd.DataFrame(columns=ALL_VARIANT_OUTPUT_COLS)
             return as_error_report(disease_df, gene, 'empty result')
         return result
     except Exception as e:
         import traceback
         error_msg = f"{type(e).__name__}: {e} || {traceback.format_exc()[-400:]}"
         print(f"Stan error for {gene}/{disease_df['as_disease'].iloc[0]}: {error_msg}")
+        if save_variant_outputs:
+            return pd.DataFrame(columns=ALL_VARIANT_OUTPUT_COLS)
         return as_error_report(disease_df, gene, error_msg)
 
 
@@ -602,7 +764,7 @@ def preprocess_gene(gene_df):
     return gene_df
 
 
-def process_disease(disease_df, h1=0.1):
+def process_disease(disease_df, h1=0.1, save_variant_outputs=False):
     """Process a single (gene, disease) pair — Phase 2.
 
     Runs the appropriate Stan model (single or multi variant) and returns
@@ -613,12 +775,17 @@ def process_disease(disease_df, h1=0.1):
     Args:
         disease_df: pandas DataFrame for one (gene, disease) pair
         h1: hyperparameter for Stan models
+        save_variant_outputs: when True, returns per-variant rows
+            (variant, parameter='xcest'|'yORest', mean, ...) matching
+            ALL_VARIANT_OUTPUT_COLS. Otherwise returns the gene-disease
+            summary matching ALL_OUTPUT_COLS.
 
     Returns:
         pandas DataFrame with posterior summaries
     """
+    out_cols = ALL_VARIANT_OUTPUT_COLS if save_variant_outputs else ALL_OUTPUT_COLS
     if disease_df.empty:
-        return pd.DataFrame(columns=ALL_OUTPUT_COLS)
+        return pd.DataFrame(columns=out_cols)
 
     gene = str(disease_df['as_gene'].iloc[0])
 
@@ -629,19 +796,22 @@ def process_disease(disease_df, h1=0.1):
         import traceback
         err = f"ModelLoad|{type(e).__name__}: {e}|{traceback.format_exc()[-500:]}"
         print(f"FATAL: Stan model load failed for {gene}: {err}")
+        if save_variant_outputs:
+            return pd.DataFrame(columns=out_cols)
         return as_error_report(disease_df.iloc[[0]], gene, err)
 
-    result = fitASmodels(disease_df, gene, h1)
+    result = fitASmodels(disease_df, gene, h1,
+                         save_variant_outputs=save_variant_outputs)
 
     if result is None or result.empty:
-        return pd.DataFrame(columns=ALL_OUTPUT_COLS)
+        return pd.DataFrame(columns=out_cols)
 
     # Ensure all output columns present (fill missing with None)
-    for col in ALL_OUTPUT_COLS:
+    for col in out_cols:
         if col not in result.columns:
             result[col] = None
 
-    return result[ALL_OUTPUT_COLS]
+    return result[out_cols]
 
 
 # =============================================================================
@@ -676,22 +846,62 @@ result_schema = StructType([
     StructField("has_burden", BooleanType(), True),
 ])
 
+# Per-variant output schema (--save_variant_outputs).
+# Mirrors result_schema but with an added `variant` column and `parameter`
+# taking values 'xcest'/'yORest'. Order matches ALL_VARIANT_OUTPUT_COLS.
+variant_result_schema = StructType([
+    StructField("gene", StringType(), True),
+    StructField("as_disease", StringType(), True),
+    StructField("parameter", StringType(), True),
+    StructField("model", StringType(), True),
+    StructField("n_variants", IntegerType(), True),
+    StructField("source", StringType(), True),
+    StructField("qtl", StringType(), True),
+    StructField("variant", StringType(), True),
+    StructField("mean", DoubleType(), True),
+    StructField("median", DoubleType(), True),
+    StructField("pct_1", DoubleType(), True),
+    StructField("pct_2_5", DoubleType(), True),
+    StructField("pct_5", DoubleType(), True),
+    StructField("pct_10", DoubleType(), True),
+    StructField("pct_25", DoubleType(), True),
+    StructField("pct_40", DoubleType(), True),
+    StructField("pct_50", DoubleType(), True),
+    StructField("pct_60", DoubleType(), True),
+    StructField("pct_75", DoubleType(), True),
+    StructField("pct_90", DoubleType(), True),
+    StructField("pct_95", DoubleType(), True),
+    StructField("pct_97_5", DoubleType(), True),
+    StructField("pct_99", DoubleType(), True),
+    StructField("pp_slope_pos", DoubleType(), True),
+    StructField("pp_slope_neg", DoubleType(), True),
+    StructField("has_burden", BooleanType(), True),
+])
+
 
 def main(args):
     spark = SparkSession.builder.appName("VIDRA_Bayesian_Analysis").getOrCreate()
     from pyspark.sql import functions as F
 
-    suffix = getattr(args, 'output_suffix', '')
-    ANALYSIS_PATH = f"gs://{args.bucket_name}/vidra_analysis_ready{suffix}"
-    ANNOTATIONS_PATH = f"gs://{args.bucket_name}/variant_annotations{suffix}"
-    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results{suffix}"
+    analysis_suffix = getattr(args, 'analysis_suffix', '')
+    annotations_suffix = getattr(args, 'annotations_suffix', '')
+    output_suffix = getattr(args, 'output_suffix', '')
+    ANALYSIS_PATH = f"gs://{args.bucket_name}/vidra_analysis_ready{analysis_suffix}"
+    ANNOTATIONS_PATH = f"gs://{args.bucket_name}/variant_annotations{annotations_suffix}"
+    OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_results{output_suffix}"
+    STAN_INPUTS_PATH = f"gs://{args.bucket_name}/stan_inputs{output_suffix}"
+    VARIANT_OUTPUT_PATH = f"gs://{args.bucket_name}/vidra_variant_results{output_suffix}"
     h1 = float(args.h1)
 
     print("--- VIDRA Bayesian Analysis ---")
-    print(f"Analysis data: {ANALYSIS_PATH}")
-    print(f"Annotations:   {ANNOTATIONS_PATH}")
-    print(f"Output:        {OUTPUT_PATH}")
-    print(f"h1:            {h1}")
+    print(f"Analysis data:    {ANALYSIS_PATH}")
+    print(f"Annotations:      {ANNOTATIONS_PATH}")
+    print(f"Output:           {OUTPUT_PATH}")
+    if args.save_stan_inputs:
+        print(f"Stan inputs:      {STAN_INPUTS_PATH}")
+    if args.save_variant_outputs:
+        print(f"Variant outputs:  {VARIANT_OUTPUT_PATH}")
+    print(f"h1:               {h1}")
 
     # =========================================================================
     # 1. LOAD ANALYSIS-READY DATA (Hive-partitioned by as_gene, 1 file per gene)
@@ -855,6 +1065,14 @@ def main(args):
     print(f"After preprocessing: {preproc_rows} rows, "
           f"{n_disease_pairs} (gene, disease) pairs")
 
+    # --- Optional: snapshot the exact per-variant DataFrame Stan will see ---
+    if args.save_stan_inputs:
+        print(f"Writing Stan-input snapshot to {STAN_INPUTS_PATH} ...")
+        df_preprocessed.write.mode("overwrite") \
+            .partitionBy("as_gene") \
+            .parquet(STAN_INPUTS_PATH)
+        print(f"Stan inputs saved to {STAN_INPUTS_PATH}")
+
     # --- Phase 2: Stan model fitting, parallelised by (gene, disease) ---
     # Repartition by (gene, disease) so each pair becomes its own Spark task.
     # This distributes work across all available executors rather than
@@ -872,6 +1090,24 @@ def main(args):
     n_result_rows = spark.read.parquet(OUTPUT_PATH).count()
     print(f"Analysis complete. {n_result_rows} result rows at {OUTPUT_PATH}")
 
+    # --- Optional: second pass to extract per-variant latent-parameter posteriors ---
+    # Re-runs Stan from the cached df_preprocessed (no preprocessing repeated).
+    # Extracts xcest, yORest, protein_prior, disease_prior per variant.
+    if args.save_variant_outputs:
+        print(f"Re-running Stan to extract per-variant outputs → "
+              f"{VARIANT_OUTPUT_PATH} ...")
+        variant_results = df_preprocessed.groupby(
+            "as_gene", "as_disease"
+        ).applyInPandas(
+            lambda pdf: process_disease(pdf, h1=h1, save_variant_outputs=True),
+            schema=variant_result_schema,
+        )
+        variant_results.coalesce(200).write.mode("overwrite").parquet(
+            VARIANT_OUTPUT_PATH)
+        n_variant_rows = spark.read.parquet(VARIANT_OUTPUT_PATH).count()
+        print(f"Per-variant outputs: {n_variant_rows} rows at "
+              f"{VARIANT_OUTPUT_PATH}")
+
 
 if __name__ == "__main__":
     import argparse
@@ -887,8 +1123,24 @@ if __name__ == "__main__":
                         help="Number of genes in test mode (default: 50)")
     parser.add_argument("--gene_list", type=str,
                         help="Path to a text file (e.g., gs://bucket/genes.txt) containing ENSG IDs (one per line) to filter the analysis")
+    parser.add_argument("--analysis_suffix", type=str, default="",
+                        help="Suffix for the input vidra_analysis_ready directory "
+                             "(e.g. '_dev' -> reads vidra_analysis_ready_dev/).")
+    parser.add_argument("--annotations_suffix", type=str, default="",
+                        help="Suffix for the input variant_annotations directory "
+                             "(e.g. '_dev' -> reads variant_annotations_dev/).")
     parser.add_argument("--output_suffix", type=str, default="",
-                        help="Suffix for input/output directory names to match Step 1 suffix "
-                             "(e.g. '_dev' -> vidra_analysis_ready_dev, variant_annotations_dev, vidra_results_dev)")
+                        help="Suffix for output directories "
+                             "(vidra_results, stan_inputs, vidra_variant_results).")
+    parser.add_argument("--save_stan_inputs", action="store_true",
+                        help="Save the exact per-variant DataFrame fed into Stan "
+                             "(post-join, post-inversion, post-imputation) to "
+                             "gs://<bucket>/stan_inputs<output_suffix>/, "
+                             "partitioned by as_gene.")
+    parser.add_argument("--save_variant_outputs", action="store_true",
+                        help="Save per-variant posterior summaries (xcest, yORest) "
+                             "from each Stan fit to "
+                             "gs://<bucket>/vidra_variant_results<output_suffix>/. "
+                             "Re-runs Stan in a second applyInPandas pass.")
     args = parser.parse_args()
     main(args)
